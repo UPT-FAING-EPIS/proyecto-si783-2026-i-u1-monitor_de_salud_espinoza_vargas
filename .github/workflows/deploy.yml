@@ -13,11 +13,11 @@ on:
   workflow_dispatch:
 
 env:
-  RESOURCE_GROUP: rg-mysql-health-monitor-uk
-  LOCATION: uksouth
+  RESOURCE_GROUP: rg-mysql-health-monitor-eus
+  LOCATION: eastus
   MYSQL_ADMIN_USER: mysqladmin
   MYSQL_VERSION: "8.0.21"
-  MYSQL_SKU: Standard_B1s
+  MYSQL_SKU: Standard_B1ms
   MYSQL_TIER: Burstable
   MYSQL_STORAGE_GB: 32
 
@@ -99,10 +99,11 @@ jobs:
       - name: Listar SKUs disponibles en la región
         run: |
           echo "SKUs disponibles en ${{ env.LOCATION }}:"
-          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json | jq '.[] | select(.name=="Standard_B1s") | .name' || true
+          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json | jq '.[] | select(.supportedFlexibleServerEditions[].name=="Burstable") | .name' 2>/dev/null || \
+          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json | jq '.[].name' | head -20 || true
           echo ""
-          echo "Capacidades de Compute:"
-          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json | jq '.[] | .name' | head -20 || true
+          echo "Tier Burstable disponible:"
+          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json 2>/dev/null | head -c 2000 || true
       # ── MySQL Flexible Server ───────────────────────────────
       - name: Crear Azure MySQL Flexible Server (si no existe)
         run: |
@@ -121,6 +122,7 @@ jobs:
               --admin-user      "${{ env.MYSQL_ADMIN_USER }}" \
               --admin-password  "${{ steps.password.outputs.value }}" \
               --sku-name        "${{ env.MYSQL_SKU }}" \
+              --tier            "${{ env.MYSQL_TIER }}" \
               --version         "${{ env.MYSQL_VERSION }}" \
               --storage-size    "${{ env.MYSQL_STORAGE_GB }}" \
               --public-access   "0.0.0.0" \
