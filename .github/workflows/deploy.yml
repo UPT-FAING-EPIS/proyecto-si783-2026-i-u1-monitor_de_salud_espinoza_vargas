@@ -1,7 +1,8 @@
 # ══════════════════════════════════════════════════════════════
-#  DB Health Monitor — Deploy to Azure (Azure SQL Database)
+#  DB Health Monitor — Deploy to Azure App Service
+#  Base de datos: SQLite embebido (sin dependencias externas)
 #  Secretos necesarios en GitHub:
-#    AZURE_CREDENTIALS       -> JSON del Service Principal de Azure
+#    AZURE_CREDENTIALS       -> JSON del Service Principal
 #    AZURE_SUBSCRIPTION_ID  -> ID de tu suscripcion Azure
 # ══════════════════════════════════════════════════════════════
 
@@ -14,32 +15,21 @@ on:
 
 env:
   RESOURCE_GROUP: rg-db-health-monitor
-  LOCATION: eastus
-  SQL_ADMIN_USER: sqladmin
-  SQL_DATABASE: db_health_monitor
 
 # ══════════════════════════════════════════════════════════════
 jobs:
 
-# ──────────────────────────────────────────────────────────────
-# JOB 1 - Infraestructura + Base de Datos (Azure SQL Database)
-# ──────────────────────────────────────────────────────────────
-  provision-database:
-    name: "1 - Infraestructura y Base de Datos"
+  deploy:
+    name: "Desplegar Monitor en Azure App Service"
     runs-on: ubuntu-latest
-
-    outputs:
-      sql_server_fqdn:    ${{ steps.get_fqdn.outputs.fqdn }}
-      sql_server_name:    ${{ steps.names.outputs.sql_server }}
-      resolved_location:  ${{ steps.create_sql.outputs.resolved_location }}
 
     steps:
 
-      # ── Checkout ────────────────────────────────────────────
+      # ── Checkout ─────────────────────────────────────────────
       - name: Checkout codigo
         uses: actions/checkout@v4
 
-      # ── Login Azure ─────────────────────────────────────────
+      # ── Login Azure ──────────────────────────────────────────
       - name: Login en Azure
         uses: azure/login@v2
         with:
@@ -48,59 +38,38 @@ jobs:
       - name: Establecer suscripcion
         run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
 
-      # ── Registrar proveedor Microsoft.Sql ───────────────────
-      - name: Registrar proveedor Microsoft.Sql
-        run: |
-          az provider register --namespace Microsoft.Sql
-          sleep 10
-
-
-      # ── Nombres unicos (deterministas) ──────────────────────
+      # ── Nombres deterministas ────────────────────────────────
       - name: Generar nombres de recursos
         id: names
         run: |
           SUFFIX=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | sha256sum | cut -c1-10)
-          echo "sql_server=sql-monitor-${SUFFIX}"  >> $GITHUB_OUTPUT
-          echo "webapp=db-monitor-${SUFFIX}"        >> $GITHUB_OUTPUT
-          echo "plan=asp-db-monitor-${SUFFIX}"      >> $GITHUB_OUTPUT
-          echo "suffix=${SUFFIX}"                    >> $GITHUB_OUTPUT
+          echo "webapp=db-monitor-${SUFFIX}"     >> $GITHUB_OUTPUT
+          echo "plan=asp-db-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
+          echo "suffix=${SUFFIX}"                 >> $GITHUB_OUTPUT
 
-      # ── Contrasena SQL (determinista, enmascarada) ──────────
-      - name: Generar contrasena SQL
-        id: password
+      # ── App Service Plan (auto-region) ───────────────────────
+      - name: Crear Resource Group y App Service Plan (auto-region)
+        id: infra
         run: |
-          HASH=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}-sql-salt-2024" \
-                 | sha256sum | awk '{print $1}' | cut -c1-18)
-          PASS="Monitor${HASH}Aa1!"
-          echo "::add-mask::${PASS}"
-          echo "value=${PASS}" >> $GITHUB_OUTPUT
+          PLAN="${{ steps.names.outputs.plan }}"
 
-      # ── Crear SQL Server + DB (auto-region con timeout) ────────
-      - name: Crear Azure SQL Server y Base de Datos (auto-region)
-        id: create_sql
-        run: |
-          SERVER="${{ steps.names.outputs.sql_server }}"
-          DB="${{ env.SQL_DATABASE }}"
-
-          # Verificar si el servidor ya existe (idempotente)
-          EXISTS=$(az sql server show \
-            --name "$SERVER" \
+          # Verificar si ya existe
+          EXISTS=$(az appservice plan show \
+            --name "$PLAN" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --query "name" -o tsv 2>/dev/null || true)
 
           if [ -n "$EXISTS" ]; then
-            echo "SQL Server ya existe: ${SERVER}"
-            LOC=$(az sql server show \
-              --name "$SERVER" \
+            echo "App Service Plan ya existe."
+            LOC=$(az appservice plan show \
+              --name "$PLAN" \
               --resource-group "${{ env.RESOURCE_GROUP }}" \
               --query "location" -o tsv 2>/dev/null || echo "swedencentral")
             echo "resolved_location=${LOC}" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Regiones en orden de prioridad para suscripciones Student.
-          # Las suscripciones de estudiante suelen permitir regiones europeas/asiaticas.
-          # Se prueban con timeout de 3 min cada una para evitar bloqueos silenciosos.
+          # Regiones en orden de prioridad para suscripciones Student
           REGIONS=(
             "swedencentral"
             "northeurope"
@@ -136,188 +105,33 @@ jobs:
               --location "${REGION}" \
               --output none 2>/dev/null || true
 
-            # Intentar crear SQL Server con timeout de 3 minutos
-            # 'timeout' evita que se cuelgue en regiones lentas o restringidas
-            if timeout 180 az sql server create \
-              --name            "$SERVER" \
-              --resource-group  "${{ env.RESOURCE_GROUP }}" \
-              --location        "${REGION}" \
-              --admin-user      "${{ env.SQL_ADMIN_USER }}" \
-              --admin-password  "${{ steps.password.outputs.value }}" \
-              --output json 2>&1; then
-
-              echo "SQL Server creado exitosamente en: ${REGION}"
+            # Intentar crear App Service Plan con timeout
+            if timeout 120 az appservice plan create \
+              --name           "$PLAN" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --location       "${REGION}" \
+              --sku            B1 \
+              --is-linux \
+              --output none 2>&1; then
+              echo "App Service Plan creado en: ${REGION}"
               echo "resolved_location=${REGION}" >> $GITHUB_OUTPUT
-
-              # Crear DB: Free tier primero, fallback Basic
-              if az sql db create \
-                --name           "$DB" \
-                --server         "$SERVER" \
-                --resource-group "${{ env.RESOURCE_GROUP }}" \
-                --edition        "Free" \
-                --output json 2>&1; then
-                echo "Base de datos creada con tier Free"
-              else
-                echo "Free tier no disponible, usando Basic..."
-                az sql db create \
-                  --name              "$DB" \
-                  --server            "$SERVER" \
-                  --resource-group    "${{ env.RESOURCE_GROUP }}" \
-                  --edition           "Basic" \
-                  --service-objective "Basic" \
-                  --max-size          "2GB" \
-                  --output json
-                echo "Base de datos creada con tier Basic"
-              fi
-
               CREATED=true
               break
             else
               echo "    Fallo o timeout en ${REGION}, siguiente..."
-              # Limpiar servidor si quedo a medias
-              az sql server delete \
-                --name "$SERVER" \
+              az appservice plan delete \
+                --name "$PLAN" \
                 --resource-group "${{ env.RESOURCE_GROUP }}" \
                 --yes 2>/dev/null || true
             fi
           done
 
           if [ "$CREATED" = false ]; then
-            echo ""
-            echo "ERROR: No se pudo crear el servidor SQL en ninguna region."
-            echo "Regiones intentadas: ${REGIONS[*]}"
-            echo ""
-            echo "Solucion manual:"
-            echo "  az sql server create --name $SERVER --resource-group ${{ env.RESOURCE_GROUP }}"
-            echo "    --location <region-permitida> ..."
+            echo "ERROR: No se pudo crear el App Service Plan en ninguna region."
             exit 1
           fi
 
-      # ── FQDN del servidor ───────────────────────────────────
-      - name: Obtener FQDN del servidor SQL
-        id: get_fqdn
-        run: |
-          FQDN=$(az sql server show \
-            --name "${{ steps.names.outputs.sql_server }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "fullyQualifiedDomainName" -o tsv)
-          echo "fqdn=${FQDN}" >> $GITHUB_OUTPUT
-          echo "FQDN: ${FQDN}"
-
-      # ── Firewall: abrir para el runner ──────────────────────
-      - name: Agregar IP del runner al firewall SQL
-        run: |
-          RUNNER_IP=$(curl -sf https://api.ipify.org)
-          echo "Runner IP: ${RUNNER_IP}"
-          az sql server firewall-rule create \
-            --server           "${{ steps.names.outputs.sql_server }}" \
-            --resource-group   "${{ env.RESOURCE_GROUP }}" \
-            --name             "gha-runner-temp" \
-            --start-ip-address "$RUNNER_IP" \
-            --end-ip-address   "$RUNNER_IP" \
-            --output none
-
-      # ── Instalar sqlcmd ─────────────────────────────────────
-      - name: Instalar sqlcmd
-        run: |
-          curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
-            | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
-            | sudo tee /etc/apt/sources.list.d/mssql-release.list
-          sudo apt-get update -q
-          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
-          echo "/opt/mssql-tools18/bin" >> $GITHUB_PATH
-
-      # ── Ejecutar script SQL de configuracion ────────────────
-      - name: Ejecutar db_health_setup.sql
-        run: |
-          sqlcmd \
-            -S "${{ steps.get_fqdn.outputs.fqdn }}" \
-            -U "${{ env.SQL_ADMIN_USER }}" \
-            -P "${{ steps.password.outputs.value }}" \
-            -d "${{ env.SQL_DATABASE }}" \
-            -C \
-            -i db_health_setup.sql
-          echo "Script SQL ejecutado exitosamente."
-
-      # ── Firewall: quitar IP del runner (siempre) ────────────
-      - name: Quitar IP del runner del firewall SQL
-        if: always()
-        run: |
-          az sql server firewall-rule delete \
-            --server         "${{ steps.names.outputs.sql_server }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --name           "gha-runner-temp" \
-            --output none 2>/dev/null || true
-
-
-# ──────────────────────────────────────────────────────────────
-# JOB 2 - Despliegue de la aplicacion Flask
-# ──────────────────────────────────────────────────────────────
-  deploy-app:
-    name: "2 - Despliegue Flask en App Service"
-    runs-on: ubuntu-latest
-    needs: provision-database
-
-    steps:
-
-      # ── Checkout ────────────────────────────────────────────
-      - name: Checkout codigo
-        uses: actions/checkout@v4
-
-      # ── Login Azure ─────────────────────────────────────────
-      - name: Login en Azure
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Establecer suscripcion
-        run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
-
-      # ── Mismos nombres deterministas ────────────────────────
-      - name: Generar nombres de recursos
-        id: names
-        run: |
-          SUFFIX=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | sha256sum | cut -c1-10)
-          echo "webapp=db-monitor-${SUFFIX}"      >> $GITHUB_OUTPUT
-          echo "plan=asp-db-monitor-${SUFFIX}"    >> $GITHUB_OUTPUT
-          echo "sql_server=sql-monitor-${SUFFIX}" >> $GITHUB_OUTPUT
-
-      # ── Misma contrasena determinista ───────────────────────
-      - name: Regenerar contrasena SQL
-        id: password
-        run: |
-          HASH=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}-sql-salt-2024" \
-                 | sha256sum | awk '{print $1}' | cut -c1-18)
-          PASS="Monitor${HASH}Aa1!"
-          echo "::add-mask::${PASS}"
-          echo "value=${PASS}" >> $GITHUB_OUTPUT
-
-      # ── App Service Plan ────────────────────────────────────
-      - name: Crear App Service Plan (si no existe)
-        run: |
-          PLAN="${{ steps.names.outputs.plan }}"
-          # Usar la misma region donde se creo el SQL Server
-          REGION="${{ needs.provision-database.outputs.resolved_location }}"
-          EXISTS=$(az appservice plan show \
-            --name "$PLAN" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "name" -o tsv 2>/dev/null || true)
-
-          if [ -z "$EXISTS" ]; then
-            echo "Creando App Service Plan en region: ${REGION}"
-            az appservice plan create \
-              --name           "$PLAN" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --location       "${REGION}" \
-              --sku            B1 \
-              --is-linux \
-              --output none
-          else
-            echo "App Service Plan ya existe."
-          fi
-
-      # ── Web App ─────────────────────────────────────────────
+      # ── Web App ──────────────────────────────────────────────
       - name: Crear Web App (si no existe)
         run: |
           APP="${{ steps.names.outputs.webapp }}"
@@ -333,26 +147,24 @@ jobs:
               --plan           "${{ steps.names.outputs.plan }}" \
               --runtime        "PYTHON|3.11" \
               --output none
+            echo "Web App creada: ${APP}"
           else
-            echo "Web App ya existe."
+            echo "Web App ya existe: ${APP}"
           fi
 
-      # ── Configurar App Settings ──────────────────────────────
-      - name: Configurar App Settings en Azure
+      # ── App Settings ─────────────────────────────────────────
+      - name: Configurar App Settings
         run: |
           az webapp config appsettings set \
             --name           "${{ steps.names.outputs.webapp }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --settings \
-              SQL_SERVER="${{ needs.provision-database.outputs.sql_server_fqdn }}" \
-              SQL_USER="${{ env.SQL_ADMIN_USER }}" \
-              SQL_PASSWORD="${{ steps.password.outputs.value }}" \
-              SQL_DATABASE="${{ env.SQL_DATABASE }}" \
+              SQLITE_PATH="/home/db_health.db" \
               WEBSITES_PORT="5000" \
               SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
             --output none
 
-      # ── Comando de inicio ────────────────────────────────────
+      # ── Startup command ──────────────────────────────────────
       - name: Configurar startup command
         run: |
           az webapp config set \
@@ -361,36 +173,14 @@ jobs:
             --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=2 server:app" \
             --output none
 
-      # ── Deploy del codigo ────────────────────────────────────
+      # ── Deploy ───────────────────────────────────────────────
       - name: Desplegar aplicacion
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ steps.names.outputs.webapp }}
           package: .
 
-      # ── Firewall SQL: agregar IPs de App Service ─────────────
-      - name: Permitir IPs de App Service en SQL Server
-        run: |
-          OUTBOUND=$(az webapp show \
-            --name           "${{ steps.names.outputs.webapp }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query          "outboundIpAddresses" -o tsv)
-
-          IFS=',' read -ra IPS <<< "$OUTBOUND"
-          IDX=0
-          for IP in "${IPS[@]}"; do
-            az sql server firewall-rule create \
-              --server           "${{ steps.names.outputs.sql_server }}" \
-              --resource-group   "${{ env.RESOURCE_GROUP }}" \
-              --name             "webapp-ip-${IDX}" \
-              --start-ip-address "$IP" \
-              --end-ip-address   "$IP" \
-              --output none 2>/dev/null || true
-            IDX=$((IDX+1))
-          done
-          echo "IPs de App Service agregadas al firewall SQL."
-
-      # ── URL final ───────────────────────────────────────────
+      # ── URL final ────────────────────────────────────────────
       - name: Mostrar URL del dashboard
         run: |
           echo ""
