@@ -50,6 +50,14 @@ jobs:
       - name: Establecer suscripción
         run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
 
+      # ── Registrar namespace Microsoft.DBforMySQL ─────────────
+      - name: Registrar proveedor Microsoft.DBforMySQL
+        run: |
+          echo "Registrando namespace Microsoft.DBforMySQL..."
+          az provider register --namespace Microsoft.DBforMySQL
+          echo "Esperando a que se registre el namespace..."
+          sleep 10
+
       # ── Limpiar Resource Group anterior (si existe) ────────
       - name: Eliminar Resource Group anterior
         run: |
