@@ -17,8 +17,8 @@ env:
   LOCATION: eastus
   MYSQL_ADMIN_USER: mysqladmin
   MYSQL_VERSION: "8.0.21"
-  MYSQL_SKU: Standard_B2s
-  MYSQL_TIER: Burstable
+  MYSQL_SKU: Standard_D2s_v3
+  MYSQL_TIER: GeneralPurpose
   MYSQL_STORAGE_GB: 32
 
 # ══════════════════════════════════════════════════════════════
@@ -301,3 +301,4 @@ jobs:
           echo "  Dashboard disponible en:"
           echo "  https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
           echo "=========================================="
+
