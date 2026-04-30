@@ -1,0 +1,303 @@
+# ══════════════════════════════════════════════════════════════
+#  MySQL Health Monitor — Deploy to Azure
+#  Secretos necesarios en GitHub:
+#    AZURE_CREDENTIALS   → JSON del Service Principal de Azure
+#    AZURE_SUBSCRIPTION_ID → ID de tu suscripción Azure
+# ══════════════════════════════════════════════════════════════
+
+name: Deploy MySQL Health Monitor to Azure
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP: rg-mysql-health-monitor
+  LOCATION: eastus
+  MYSQL_ADMIN_USER: mysqladmin
+  MYSQL_VERSION: "8.0.21"
+  MYSQL_SKU: Standard_B1ms
+  MYSQL_TIER: Burstable
+  MYSQL_STORAGE_GB: 32
+
+# ══════════════════════════════════════════════════════════════
+jobs:
+
+# ──────────────────────────────────────────────────────────────
+# JOB 1 — Infraestructura + Base de Datos
+# ──────────────────────────────────────────────────────────────
+  provision-database:
+    name: "1 · Infraestructura y Base de Datos"
+    runs-on: ubuntu-latest
+
+    outputs:
+      mysql_server_name: ${{ steps.names.outputs.mysql_server }}
+      mysql_fqdn:        ${{ steps.get_fqdn.outputs.fqdn }}
+
+    steps:
+
+      # ── Checkout ────────────────────────────────────────────
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # ── Login Azure ─────────────────────────────────────────
+      - name: Login en Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Establecer suscripción
+        run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+      # ── Nombres únicos (deterministas por subscription) ─────
+      - name: Generar nombres de recursos
+        id: names
+        run: |
+          SUFFIX=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | sha256sum | cut -c1-10)
+          echo "mysql_server=mysql-monitor-${SUFFIX}"  >> $GITHUB_OUTPUT
+          echo "suffix=${SUFFIX}"                       >> $GITHUB_OUTPUT
+
+      # ── Contraseña MySQL (determinista, enmascarada) ────────
+      - name: Generar contraseña MySQL
+        id: password
+        run: |
+          HASH=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}-mysql-salt-2024" \
+                 | sha256sum | awk '{print $1}' | cut -c1-18)
+          PASS="Monitor${HASH}Aa1!"
+          echo "::add-mask::${PASS}"
+          echo "value=${PASS}" >> $GITHUB_OUTPUT
+
+      # ── Resource Group ──────────────────────────────────────
+      - name: Crear Resource Group
+        run: |
+          az group create \
+            --name    "${{ env.RESOURCE_GROUP }}" \
+            --location "${{ env.LOCATION }}" \
+            --output none
+
+      # ── MySQL Flexible Server ───────────────────────────────
+      - name: Crear Azure MySQL Flexible Server (si no existe)
+        run: |
+          SERVER="${{ steps.names.outputs.mysql_server }}"
+          EXISTS=$(az mysql flexible-server show \
+            --name "$SERVER" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "name" -o tsv 2>/dev/null || true)
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creando servidor MySQL: ${SERVER}"
+            az mysql flexible-server create \
+              --name            "$SERVER" \
+              --resource-group  "${{ env.RESOURCE_GROUP }}" \
+              --location        "${{ env.LOCATION }}" \
+              --admin-user      "${{ env.MYSQL_ADMIN_USER }}" \
+              --admin-password  "${{ steps.password.outputs.value }}" \
+              --sku-name        "${{ env.MYSQL_SKU }}" \
+              --tier            "${{ env.MYSQL_TIER }}" \
+              --version         "${{ env.MYSQL_VERSION }}" \
+              --storage-size    "${{ env.MYSQL_STORAGE_GB }}" \
+              --public-access   "0.0.0.0" \
+              --output none
+          else
+            echo "Servidor MySQL ya existe: ${SERVER}"
+          fi
+
+      # ── FQDN del servidor ───────────────────────────────────
+      - name: Obtener FQDN del servidor MySQL
+        id: get_fqdn
+        run: |
+          FQDN=$(az mysql flexible-server show \
+            --name "${{ steps.names.outputs.mysql_server }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "fullyQualifiedDomainName" -o tsv)
+          echo "fqdn=${FQDN}" >> $GITHUB_OUTPUT
+          echo "FQDN: ${FQDN}"
+
+      # ── Firewall: abrir para el runner ──────────────────────
+      - name: Agregar IP del runner al firewall MySQL
+        id: firewall_runner
+        run: |
+          RUNNER_IP=$(curl -sf https://api.ipify.org)
+          echo "Runner IP: ${RUNNER_IP}"
+          az mysql flexible-server firewall-rule create \
+            --name           "${{ steps.names.outputs.mysql_server }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --rule-name      "gha-runner-temp" \
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address   "$RUNNER_IP" \
+            --output none
+
+      # ── Instalar cliente MySQL ──────────────────────────────
+      - name: Instalar cliente MySQL
+        run: sudo apt-get install -y mysql-client
+
+      # ── Ejecutar script SQL de configuración ────────────────
+      - name: Ejecutar db_health_setup.sql
+        env:
+          MYSQL_PWD: ${{ steps.password.outputs.value }}
+        run: |
+          mysql \
+            --host="${{ steps.get_fqdn.outputs.fqdn }}" \
+            --user="${{ env.MYSQL_ADMIN_USER }}" \
+            --ssl-mode=REQUIRED \
+            --connect-timeout=30 \
+            < db_health_setup.sql
+          echo "Script SQL ejecutado exitosamente."
+
+      # ── Firewall: quitar IP del runner (siempre) ────────────
+      - name: Quitar IP del runner del firewall MySQL
+        if: always()
+        run: |
+          az mysql flexible-server firewall-rule delete \
+            --name           "${{ steps.names.outputs.mysql_server }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --rule-name      "gha-runner-temp" \
+            --yes \
+            --output none 2>/dev/null || true
+
+
+# ──────────────────────────────────────────────────────────────
+# JOB 2 — Despliegue de la aplicación Flask
+# ──────────────────────────────────────────────────────────────
+  deploy-app:
+    name: "2 · Despliegue Flask en App Service"
+    runs-on: ubuntu-latest
+    needs: provision-database
+
+    steps:
+
+      # ── Checkout ────────────────────────────────────────────
+      - name: Checkout código
+        uses: actions/checkout@v4
+
+      # ── Login Azure ─────────────────────────────────────────
+      - name: Login en Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Establecer suscripción
+        run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+
+      # ── Mismos nombres deterministas ────────────────────────
+      - name: Generar nombres de recursos
+        id: names
+        run: |
+          SUFFIX=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | sha256sum | cut -c1-10)
+          echo "webapp=mysql-monitor-${SUFFIX}"     >> $GITHUB_OUTPUT
+          echo "plan=asp-mysql-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
+          echo "mysql_server=mysql-monitor-${SUFFIX}" >> $GITHUB_OUTPUT
+
+      # ── Misma contraseña determinista ───────────────────────
+      - name: Regenerar contraseña MySQL
+        id: password
+        run: |
+          HASH=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}-mysql-salt-2024" \
+                 | sha256sum | awk '{print $1}' | cut -c1-18)
+          PASS="Monitor${HASH}Aa1!"
+          echo "::add-mask::${PASS}"
+          echo "value=${PASS}" >> $GITHUB_OUTPUT
+
+      # ── App Service Plan ────────────────────────────────────
+      - name: Crear App Service Plan (si no existe)
+        run: |
+          PLAN="${{ steps.names.outputs.plan }}"
+          EXISTS=$(az appservice plan show \
+            --name "$PLAN" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "name" -o tsv 2>/dev/null || true)
+
+          if [ -z "$EXISTS" ]; then
+            az appservice plan create \
+              --name           "$PLAN" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --location       "${{ env.LOCATION }}" \
+              --sku            B1 \
+              --is-linux \
+              --output none
+          else
+            echo "App Service Plan ya existe."
+          fi
+
+      # ── Web App ─────────────────────────────────────────────
+      - name: Crear Web App (si no existe)
+        run: |
+          APP="${{ steps.names.outputs.webapp }}"
+          EXISTS=$(az webapp show \
+            --name "$APP" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "name" -o tsv 2>/dev/null || true)
+
+          if [ -z "$EXISTS" ]; then
+            az webapp create \
+              --name           "$APP" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --plan           "${{ steps.names.outputs.plan }}" \
+              --runtime        "PYTHON|3.11" \
+              --output none
+          else
+            echo "Web App ya existe."
+          fi
+
+      # ── Configurar App Settings (variables de entorno) ──────
+      - name: Configurar App Settings en Azure
+        run: |
+          az webapp config appsettings set \
+            --name           "${{ steps.names.outputs.webapp }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --settings \
+              MYSQL_HOST="${{ needs.provision-database.outputs.mysql_fqdn }}" \
+              MYSQL_USER="${{ env.MYSQL_ADMIN_USER }}" \
+              MYSQL_PASSWORD="${{ steps.password.outputs.value }}" \
+              MYSQL_DATABASE="db_health_monitor" \
+              WEBSITES_PORT="5000" \
+              SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
+            --output none
+
+      # ── Comando de inicio ────────────────────────────────────
+      - name: Configurar startup command
+        run: |
+          az webapp config set \
+            --name           "${{ steps.names.outputs.webapp }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=2 server:app" \
+            --output none
+
+      # ── Deploy del código ────────────────────────────────────
+      - name: Desplegar aplicación
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ steps.names.outputs.webapp }}
+          package: .
+
+      # ── Firewall MySQL: agregar IPs de App Service ───────────
+      - name: Permitir IPs de App Service en MySQL
+        run: |
+          OUTBOUND=$(az webapp show \
+            --name           "${{ steps.names.outputs.webapp }}" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query          "outboundIpAddresses" -o tsv)
+
+          IFS=',' read -ra IPS <<< "$OUTBOUND"
+          IDX=0
+          for IP in "${IPS[@]}"; do
+            az mysql flexible-server firewall-rule create \
+              --name           "${{ steps.names.outputs.mysql_server }}" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --rule-name      "webapp-ip-${IDX}" \
+              --start-ip-address "$IP" \
+              --end-ip-address   "$IP" \
+              --output none 2>/dev/null || true
+            IDX=$((IDX+1))
+          done
+          echo "IPs de App Service agregadas al firewall MySQL."
+
+      # ── URL final ───────────────────────────────────────────
+      - name: Mostrar URL del dashboard
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "  Dashboard disponible en:"
+          echo "  https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
+          echo "=========================================="

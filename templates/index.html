@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MySQL Health Monitor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+
+<!-- ═══════════════════════════  HEADER  ═══════════════════════════ -->
+<header class="header">
+  <div class="header-left">
+    <div class="logo">
+      <svg width="28" height="28" viewBox="0 0 32 32" fill="none">
+        <path d="M16 2L4 8v8c0 7.7 5.2 14.9 12 17 6.8-2.1 12-9.3 12-17V8L16 2z" fill="url(#shield)"/>
+        <circle cx="16" cy="16" r="5" fill="white" fill-opacity="0.9"/>
+        <defs><linearGradient id="shield" x1="4" y1="2" x2="28" y2="27"><stop stop-color="#4a9eff"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs>
+      </svg>
+      <span class="logo-text">MySQL<span class="accent">Monitor</span></span>
+    </div>
+    <div class="server-info">
+      <span id="hdr-version" class="badge">–</span>
+      <span id="hdr-uptime" class="badge">–</span>
+    </div>
+  </div>
+  <div class="header-right">
+    <div id="alert-badge" class="alert-badge hidden">
+      <span id="alert-count">0</span> alertas
+    </div>
+    <div class="refresh-wrap">
+      <span class="refresh-label">Actualizando en</span>
+      <div class="countdown-ring">
+        <svg viewBox="0 0 36 36">
+          <circle cx="18" cy="18" r="15" stroke="#2d2d4a" stroke-width="3" fill="none"/>
+          <circle id="ring-progress" cx="18" cy="18" r="15"
+                  stroke="url(#rgrad)" stroke-width="3" fill="none"
+                  stroke-dasharray="94.2 94.2" stroke-linecap="round"
+                  transform="rotate(-90 18 18)"/>
+          <defs><linearGradient id="rgrad" x1="0" y1="0" x2="1" y2="1">
+            <stop stop-color="#4a9eff"/><stop offset="1" stop-color="#a855f7"/>
+          </linearGradient></defs>
+        </svg>
+        <span id="countdown-num" class="countdown-num">5</span>
+      </div>
+    </div>
+    <div id="conn-status" class="conn-dot dot-ok" title="Conectado"></div>
+  </div>
+</header>
+
+<!-- ═══════════════════════  ALERT BAR  ════════════════════════════ -->
+<div id="alert-bar" class="alert-bar hidden"></div>
+
+<!-- ═══════════════════════  MAIN CONTENT  ═════════════════════════ -->
+<main class="main">
+
+  <!-- KPI CARDS -->
+  <section class="kpi-grid">
+    <div class="kpi-card" id="kpi-connections">
+      <div class="kpi-icon">🔌</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Conexiones</div>
+        <div class="kpi-value" id="kpi-conn-val">–/–</div>
+        <div class="kpi-sub" id="kpi-conn-pct">– % usado</div>
+      </div>
+      <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-conn-bar"></div></div>
+    </div>
+
+    <div class="kpi-card" id="kpi-qps">
+      <div class="kpi-icon">⚡</div>
+      <div class="kpi-body">
+        <div class="kpi-label">QPS</div>
+        <div class="kpi-value" id="kpi-qps-val">–</div>
+        <div class="kpi-sub">Queries por segundo</div>
+      </div>
+    </div>
+
+    <div class="kpi-card" id="kpi-cache">
+      <div class="kpi-icon">🗄️</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Cache Hit Ratio</div>
+        <div class="kpi-value" id="kpi-cache-val">–</div>
+        <div class="kpi-sub">InnoDB Buffer Pool</div>
+      </div>
+      <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-cache-bar"></div></div>
+    </div>
+
+    <div class="kpi-card" id="kpi-threads">
+      <div class="kpi-icon">🔄</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Threads</div>
+        <div class="kpi-value" id="kpi-threads-val">–</div>
+        <div class="kpi-sub">Ejecutando / En caché</div>
+      </div>
+    </div>
+
+    <div class="kpi-card" id="kpi-slow">
+      <div class="kpi-icon">🐢</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Queries Lentas</div>
+        <div class="kpi-value" id="kpi-slow-val">–</div>
+        <div class="kpi-sub">Acumuladas</div>
+      </div>
+    </div>
+
+    <div class="kpi-card" id="kpi-bp">
+      <div class="kpi-icon">💾</div>
+      <div class="kpi-body">
+        <div class="kpi-label">Buffer Pool</div>
+        <div class="kpi-value" id="kpi-bp-val">–</div>
+        <div class="kpi-sub" id="kpi-bp-sub">– % utilizado</div>
+      </div>
+      <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-bp-bar"></div></div>
+    </div>
+  </section>
+
+  <!-- CHARTS ROW -->
+  <section class="charts-grid">
+    <div class="glass-card chart-card">
+      <h3 class="card-title">📈 Queries por Segundo</h3>
+      <canvas id="chart-qps"></canvas>
+    </div>
+    <div class="glass-card chart-card">
+      <h3 class="card-title">🔌 Conexiones en el tiempo</h3>
+      <canvas id="chart-conn"></canvas>
+    </div>
+    <div class="glass-card chart-card">
+      <h3 class="card-title">🗄️ Buffer Pool Hit Ratio</h3>
+      <canvas id="chart-cache"></canvas>
+    </div>
+  </section>
+
+  <!-- DML STATS + PROCESSLIST -->
+  <section class="mid-grid">
+    <div class="glass-card">
+      <h3 class="card-title">📊 Operaciones DML</h3>
+      <canvas id="chart-dml" style="max-height:220px"></canvas>
+    </div>
+
+    <div class="glass-card process-card">
+      <h3 class="card-title">🔄 Procesos Activos <span id="proc-count" class="badge-sm">0</span></h3>
+      <div class="table-wrap">
+        <table class="data-table" id="proc-table">
+          <thead>
+            <tr>
+              <th>ID</th><th>Usuario</th><th>BD</th><th>Comando</th>
+              <th>Seg</th><th>Estado</th><th>Query</th>
+            </tr>
+          </thead>
+          <tbody id="proc-body">
+            <tr><td colspan="7" class="empty-row">Sin procesos activos</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- DB SIZES + TOP TABLES -->
+  <section class="bottom-grid">
+    <div class="glass-card">
+      <h3 class="card-title">💽 Tamaño por Base de Datos</h3>
+      <div class="table-wrap">
+        <table class="data-table" id="db-table">
+          <thead><tr><th>Base de Datos</th><th>Tamaño</th><th>Tablas</th><th>Filas (est.)</th><th>%</th></tr></thead>
+          <tbody id="db-body"><tr><td colspan="5" class="empty-row">Cargando…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="glass-card">
+      <h3 class="card-title">🏆 Top Tablas por Tamaño</h3>
+      <div class="table-wrap">
+        <table class="data-table" id="tbl-table">
+          <thead><tr><th>BD</th><th>Tabla</th><th>Engine</th><th>Tamaño</th><th>Filas (est.)</th></tr></thead>
+          <tbody id="tbl-body"><tr><td colspan="5" class="empty-row">Cargando…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- REPLICATION (condicional) -->
+  <section id="replication-section" class="hidden">
+    <div class="glass-card repl-card">
+      <h3 class="card-title">🔁 Replicación</h3>
+      <div class="repl-grid">
+        <div class="repl-item">
+          <div class="repl-label">IO Thread</div>
+          <div id="repl-io" class="repl-val">–</div>
+        </div>
+        <div class="repl-item">
+          <div class="repl-label">SQL Thread</div>
+          <div id="repl-sql" class="repl-val">–</div>
+        </div>
+        <div class="repl-item">
+          <div class="repl-label">Lag (segundos)</div>
+          <div id="repl-lag" class="repl-val">–</div>
+        </div>
+        <div class="repl-item">
+          <div class="repl-label">Master Host</div>
+          <div id="repl-host" class="repl-val">–</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  Último update: <span id="last-update">–</span>
+  &nbsp;|&nbsp; MySQL Health Monitor &nbsp;|&nbsp;
+  <a href="/api/metrics" target="_blank">API JSON</a>
+</footer>
+
+<script src="/static/dashboard.js"></script>
+</body>
+</html>

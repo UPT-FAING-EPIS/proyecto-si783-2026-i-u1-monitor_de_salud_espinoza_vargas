@@ -1,0 +1,14 @@
+# Credenciales locales — NO subir al repositorio
+config.ini
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
