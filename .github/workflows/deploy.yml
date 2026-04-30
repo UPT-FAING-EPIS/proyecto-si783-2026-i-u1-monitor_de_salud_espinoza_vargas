@@ -50,6 +50,18 @@ jobs:
       - name: Establecer suscripción
         run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
 
+      # ── Limpiar Resource Group anterior (si existe) ────────
+      - name: Eliminar Resource Group anterior
+        run: |
+          echo "Intentando eliminar resource group anterior..."
+          az group delete \
+            --name "${{ env.RESOURCE_GROUP }}" \
+            --yes \
+            --no-wait \
+            2>/dev/null || echo "Resource group no existía o ya fue eliminado"
+          echo "Esperando a que se limpie..."
+          sleep 30
+
       # ── Nombres únicos (deterministas por subscription) ─────
       - name: Generar nombres de recursos
         id: names
