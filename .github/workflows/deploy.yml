@@ -79,7 +79,10 @@ jobs:
       - name: Listar SKUs disponibles en la región
         run: |
           echo "SKUs disponibles en ${{ env.LOCATION }}:"
-          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o table || echo "No se pudo listar SKUs"
+          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json | jq '.[] | select(.name=="Standard_B1s") | .name' || true
+          echo ""
+          echo "Capacidades de Compute:"
+          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json | jq '.[] | .name' | head -20 || true
       # ── MySQL Flexible Server ───────────────────────────────
       - name: Crear Azure MySQL Flexible Server (si no existe)
         run: |
@@ -98,11 +101,10 @@ jobs:
               --admin-user      "${{ env.MYSQL_ADMIN_USER }}" \
               --admin-password  "${{ steps.password.outputs.value }}" \
               --sku-name        "${{ env.MYSQL_SKU }}" \
-              --tier            "${{ env.MYSQL_TIER }}" \
               --version         "${{ env.MYSQL_VERSION }}" \
               --storage-size    "${{ env.MYSQL_STORAGE_GB }}" \
               --public-access   "0.0.0.0" \
-              --output none
+              --output json
           else
             echo "Servidor MySQL ya existe: ${SERVER}"
           fi
