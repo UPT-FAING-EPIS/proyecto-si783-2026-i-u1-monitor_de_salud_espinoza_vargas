@@ -54,16 +54,6 @@ jobs:
           az provider register --namespace Microsoft.Sql
           sleep 10
 
-      # ── Limpiar Resource Group anterior ─────────────────────
-      - name: Eliminar Resource Group anterior
-        run: |
-          az group delete \
-            --name "${{ env.RESOURCE_GROUP }}" \
-            --yes \
-            --no-wait \
-            2>/dev/null || echo "Resource group no existia"
-          echo "Esperando limpieza (60s)..."
-          sleep 60
 
       # ── Nombres unicos (deterministas) ──────────────────────
       - name: Generar nombres de recursos
@@ -85,14 +75,14 @@ jobs:
           echo "::add-mask::${PASS}"
           echo "value=${PASS}" >> $GITHUB_OUTPUT
 
-      # ── Crear SQL Server + DB (auto-region permitida) ────────
+      # ── Crear SQL Server + DB (auto-region con timeout) ────────
       - name: Crear Azure SQL Server y Base de Datos (auto-region)
         id: create_sql
         run: |
           SERVER="${{ steps.names.outputs.sql_server }}"
           DB="${{ env.SQL_DATABASE }}"
 
-          # Verificar si el servidor ya existe
+          # Verificar si el servidor ya existe (idempotente)
           EXISTS=$(az sql server show \
             --name "$SERVER" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
@@ -103,47 +93,52 @@ jobs:
             LOC=$(az sql server show \
               --name "$SERVER" \
               --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --query "location" -o tsv 2>/dev/null || echo "eastus")
+              --query "location" -o tsv 2>/dev/null || echo "swedencentral")
             echo "resolved_location=${LOC}" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Obtener regiones permitidas por la politica de la suscripcion
-          echo "Obteniendo regiones permitidas por la suscripcion..."
-          ALLOWED_REGIONS=$(az account list-locations \
-            --query "[].name" -o tsv 2>/dev/null | tr '\n' ' ')
-          echo "Regiones disponibles: ${ALLOWED_REGIONS}"
-
-          # Orden de preferencia (Azure SQL tiene cobertura amplia)
-          PREFERRED=("eastus" "eastus2" "westus" "westus2" "centralus" \
-                     "southcentralus" "northcentralus" "westcentralus" \
-                     "northeurope" "westeurope" "uksouth" "ukwest" \
-                     "southeastasia" "eastasia" "japaneast" "japanwest" \
-                     "australiaeast" "australiasoutheast" \
-                     "brazilsouth" "canadacentral" "canadaeast" \
-                     "koreacentral" "koreasouth" "francecentral" \
-                     "germanywestcentral" "norwayeast" "switzerlandnorth")
+          # Regiones en orden de prioridad para suscripciones Student.
+          # Las suscripciones de estudiante suelen permitir regiones europeas/asiaticas.
+          # Se prueban con timeout de 3 min cada una para evitar bloqueos silenciosos.
+          REGIONS=(
+            "swedencentral"
+            "northeurope"
+            "westeurope"
+            "uksouth"
+            "francecentral"
+            "germanywestcentral"
+            "norwayeast"
+            "switzerlandnorth"
+            "australiaeast"
+            "southeastasia"
+            "centralindia"
+            "japaneast"
+            "koreacentral"
+            "canadacentral"
+            "brazilsouth"
+            "eastus"
+            "eastus2"
+            "westus2"
+            "centralus"
+            "southcentralus"
+          )
 
           CREATED=false
 
-          for REGION in "${PREFERRED[@]}"; do
-            # Solo intentar si la region esta permitida
-            if ! echo "$ALLOWED_REGIONS" | grep -qw "$REGION"; then
-              echo "Saltando ${REGION} (no permitida por politica)"
-              continue
-            fi
-
+          for REGION in "${REGIONS[@]}"; do
             echo ""
             echo ">>> Intentando region: ${REGION}"
 
-            # Crear/actualizar resource group en esta region
+            # Crear resource group en esta region
             az group create \
               --name     "${{ env.RESOURCE_GROUP }}" \
               --location "${REGION}" \
               --output none 2>/dev/null || true
 
-            # Intentar crear el SQL Server
-            if az sql server create \
+            # Intentar crear SQL Server con timeout de 3 minutos
+            # 'timeout' evita que se cuelgue en regiones lentas o restringidas
+            if timeout 180 az sql server create \
               --name            "$SERVER" \
               --resource-group  "${{ env.RESOURCE_GROUP }}" \
               --location        "${REGION}" \
@@ -151,10 +146,10 @@ jobs:
               --admin-password  "${{ steps.password.outputs.value }}" \
               --output json 2>&1; then
 
-              echo "SQL Server creado en ${REGION}"
+              echo "SQL Server creado exitosamente en: ${REGION}"
               echo "resolved_location=${REGION}" >> $GITHUB_OUTPUT
 
-              # Crear la base de datos (Free primero, fallback Basic)
+              # Crear DB: Free tier primero, fallback Basic
               if az sql db create \
                 --name           "$DB" \
                 --server         "$SERVER" \
@@ -178,7 +173,7 @@ jobs:
               CREATED=true
               break
             else
-              echo "    Fallo en ${REGION}, probando siguiente..."
+              echo "    Fallo o timeout en ${REGION}, siguiente..."
               # Limpiar servidor si quedo a medias
               az sql server delete \
                 --name "$SERVER" \
@@ -189,9 +184,12 @@ jobs:
 
           if [ "$CREATED" = false ]; then
             echo ""
-            echo "ERROR: No se pudo crear el servidor SQL en ninguna region permitida."
-            echo "Regiones intentadas: ${PREFERRED[*]}"
-            echo "Regiones permitidas por la suscripcion: ${ALLOWED_REGIONS}"
+            echo "ERROR: No se pudo crear el servidor SQL en ninguna region."
+            echo "Regiones intentadas: ${REGIONS[*]}"
+            echo ""
+            echo "Solucion manual:"
+            echo "  az sql server create --name $SERVER --resource-group ${{ env.RESOURCE_GROUP }}"
+            echo "    --location <region-permitida> ..."
             exit 1
           fi
 
