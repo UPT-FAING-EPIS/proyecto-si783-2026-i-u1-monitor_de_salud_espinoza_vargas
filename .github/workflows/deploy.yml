@@ -13,12 +13,12 @@ on:
   workflow_dispatch:
 
 env:
-  RESOURCE_GROUP: rg-mysql-health-monitor
-  LOCATION: eastus
+  RESOURCE_GROUP: rg-mysql-health-monitor-westus
+  LOCATION: westus
   MYSQL_ADMIN_USER: mysqladmin
   MYSQL_VERSION: "8.0.21"
-  MYSQL_SKU: Standard_D2s_v3
-  MYSQL_TIER: GeneralPurpose
+  MYSQL_SKU: Standard_B1s
+  MYSQL_TIER: Burstable
   MYSQL_STORAGE_GB: 32
 
 # ══════════════════════════════════════════════════════════════
@@ -75,7 +75,11 @@ jobs:
             --name    "${{ env.RESOURCE_GROUP }}" \
             --location "${{ env.LOCATION }}" \
             --output none
-
+      # ── Diagnosticar SKUs disponibles ────────────────────
+      - name: Listar SKUs disponibles en la región
+        run: |
+          echo "SKUs disponibles en ${{ env.LOCATION }}:"
+          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o table || echo "No se pudo listar SKUs"
       # ── MySQL Flexible Server ───────────────────────────────
       - name: Crear Azure MySQL Flexible Server (si no existe)
         run: |
@@ -301,4 +305,3 @@ jobs:
           echo "  Dashboard disponible en:"
           echo "  https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
           echo "=========================================="
-
