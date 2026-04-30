@@ -13,7 +13,11 @@ on:
   workflow_dispatch:
 
 env:
+<<<<<<< HEAD
   RESOURCE_GROUP: rg-db-health-monitor
+=======
+  RESOURCE_GROUP: rg-mysql-health-monitor-eus
+>>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
   LOCATION: eastus
   SQL_ADMIN_USER: sqladmin
   SQL_DATABASE: db_health_monitor
@@ -22,7 +26,11 @@ env:
 jobs:
 
 # ──────────────────────────────────────────────────────────────
+<<<<<<< HEAD
 # JOB 1 — Infraestructura + Base de Datos (Azure SQL Database)
+=======
+# JOB 1 — Infraestructura + Base de Datosa
+>>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
 # ──────────────────────────────────────────────────────────────
   provision-database:
     name: "1 · Infraestructura y Base de Datos"
@@ -47,6 +55,7 @@ jobs:
       - name: Establecer suscripción
         run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
 
+<<<<<<< HEAD
       # ── Registrar proveedor Microsoft.Sql ───────────────────
       - name: Registrar proveedor Microsoft.Sql
         run: |
@@ -56,15 +65,37 @@ jobs:
       # ── Limpiar Resource Group anterior ────────────────────
       - name: Eliminar Resource Group anterior
         run: |
+=======
+      # ── Registrar namespace Microsoft.DBforMySQL ─────────────
+      - name: Registrar proveedor Microsoft.DBforMySQL
+        run: |
+          echo "Registrando namespace Microsoft.DBforMySQL..."
+          az provider register --namespace Microsoft.DBforMySQL
+          echo "Esperando a que se registre el namespace..."
+          sleep 10
+
+      # ── Limpiar Resource Group anterior (si existe) ────────
+      - name: Eliminar Resource Group anterior
+        run: |
+          echo "Intentando eliminar resource group anterior..."
+>>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
           az group delete \
             --name "${{ env.RESOURCE_GROUP }}" \
             --yes \
             --no-wait \
+<<<<<<< HEAD
             2>/dev/null || echo "Resource group no existía"
           echo "Esperando limpieza (60s)..."
           sleep 60
 
       # ── Nombres únicos (deterministas) ──────────────────────
+=======
+            2>/dev/null || echo "Resource group no existía o ya fue eliminado"
+          echo "Esperando a que se limpie completamente (60 segundos)..."
+          sleep 60
+
+      # ── Nombres únicos (deterministas por subscription) ─────
+>>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
       - name: Generar nombres de recursos
         id: names
         run: |
@@ -84,23 +115,35 @@ jobs:
           echo "::add-mask::${PASS}"
           echo "value=${PASS}" >> $GITHUB_OUTPUT
 
-      # ── Resource Group ──────────────────────────────────────
-      - name: Crear Resource Group
+      # ── Resource Group inicial ──────────────────────────────
+      - name: Crear Resource Group inicial
         run: |
           az group create \
             --name     "${{ env.RESOURCE_GROUP }}" \
             --location "${{ env.LOCATION }}" \
             --output none
 
+<<<<<<< HEAD
       # ── Azure SQL Server ────────────────────────────────────
       - name: Crear Azure SQL Server (si no existe)
         run: |
           SERVER="${{ steps.names.outputs.sql_server }}"
           EXISTS=$(az sql server show \
+=======
+      # ── MySQL Flexible Server (auto-región + auto-SKU) ──────
+      - name: Crear Azure MySQL Flexible Server (auto-región)
+        id: create_mysql
+        run: |
+          SERVER="${{ steps.names.outputs.mysql_server }}"
+
+          # Verificar si ya existe
+          EXISTS=$(az mysql flexible-server show \
+>>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
             --name "$SERVER" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --query "name" -o tsv 2>/dev/null || true)
 
+<<<<<<< HEAD
           if [ -z "$EXISTS" ]; then
             echo "Creando SQL Server: ${SERVER}"
             az sql server create \
@@ -149,6 +192,75 @@ jobs:
             fi
           else
             echo "Base de datos ya existe: ${DB}"
+=======
+          if [ -n "$EXISTS" ]; then
+            echo "Servidor MySQL ya existe: ${SERVER}"
+            USED_LOC=$(az mysql flexible-server show \
+              --name "$SERVER" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --query "location" -o tsv 2>/dev/null || echo "${{ env.LOCATION }}")
+            echo "resolved_location=${USED_LOC}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Regiones a intentar (orden de disponibilidad general)
+          REGIONS=("eastus" "eastus2" "westus2" "centralus" "westus" \
+                   "northeurope" "westeurope" "southeastasia" \
+                   "australiaeast" "brazilsouth" "canadacentral" \
+                   "japaneast" "koreacentral")
+
+          # SKUs Burstable a intentar
+          SKUS=("Standard_B1ms" "Standard_B2s" "Standard_B2ms" "Standard_B4ms")
+
+          CREATED=false
+
+          for REGION in "${REGIONS[@]}"; do
+            echo ""
+            echo ">>> Intentando región: ${REGION}"
+
+            # Reubicar el resource group en esta región
+            az group create \
+              --name    "${{ env.RESOURCE_GROUP }}" \
+              --location "${REGION}" \
+              --output none 2>/dev/null || true
+
+            for SKU in "${SKUS[@]}"; do
+              echo "    SKU: ${SKU} (Burstable)"
+
+              if az mysql flexible-server create \
+                --name            "$SERVER" \
+                --resource-group  "${{ env.RESOURCE_GROUP }}" \
+                --location        "${REGION}" \
+                --admin-user      "${{ env.MYSQL_ADMIN_USER }}" \
+                --admin-password  "${{ steps.password.outputs.value }}" \
+                --sku-name        "${SKU}" \
+                --tier            "Burstable" \
+                --version         "${{ env.MYSQL_VERSION }}" \
+                --storage-size    "${{ env.MYSQL_STORAGE_GB }}" \
+                --public-access   "0.0.0.0" \
+                --output json 2>&1; then
+                echo ""
+                echo "✔ Servidor creado: región=${REGION} SKU=${SKU}"
+                echo "resolved_location=${REGION}" >> $GITHUB_OUTPUT
+                CREATED=true
+                break 2
+              else
+                echo "    ✗ Falló ${SKU} en ${REGION}"
+                # Limpiar si quedó a medias
+                az mysql flexible-server delete \
+                  --name "$SERVER" \
+                  --resource-group "${{ env.RESOURCE_GROUP }}" \
+                  --yes 2>/dev/null || true
+              fi
+            done
+          done
+
+          if [ "$CREATED" = false ]; then
+            echo ""
+            echo "ERROR: No se pudo crear el servidor en ninguna región/SKU disponible."
+            echo "Verifica la cuota de tu suscripción en Azure Portal > Subscriptions > Usage + quotas"
+            exit 1
+>>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
           fi
 
       # ── FQDN del servidor ───────────────────────────────────
