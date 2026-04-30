@@ -13,8 +13,8 @@ on:
   workflow_dispatch:
 
 env:
-  RESOURCE_GROUP: rg-mysql-health-monitor-scu
-  LOCATION: southcentralus
+  RESOURCE_GROUP: rg-mysql-health-monitor-uk
+  LOCATION: uksouth
   MYSQL_ADMIN_USER: mysqladmin
   MYSQL_VERSION: "8.0.21"
   MYSQL_SKU: Standard_B1s
@@ -67,8 +67,8 @@ jobs:
             --yes \
             --no-wait \
             2>/dev/null || echo "Resource group no existía o ya fue eliminado"
-          echo "Esperando a que se limpie..."
-          sleep 30
+          echo "Esperando a que se limpie completamente (60 segundos)..."
+          sleep 60
 
       # ── Nombres únicos (deterministas por subscription) ─────
       - name: Generar nombres de recursos
