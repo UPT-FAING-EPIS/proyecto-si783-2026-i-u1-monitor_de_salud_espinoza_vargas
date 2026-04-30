@@ -84,70 +84,114 @@ jobs:
           echo "::add-mask::${PASS}"
           echo "value=${PASS}" >> $GITHUB_OUTPUT
 
-      # ── Resource Group ──────────────────────────────────────
-      - name: Crear Resource Group
-        run: |
-          az group create \
-            --name     "${{ env.RESOURCE_GROUP }}" \
-            --location "${{ env.LOCATION }}" \
-            --output none
-
-      # ── Azure SQL Server ────────────────────────────────────
-      - name: Crear Azure SQL Server (si no existe)
+      # ── Crear SQL Server + DB (auto-region permitida) ────────
+      - name: Crear Azure SQL Server y Base de Datos (auto-region)
+        id: create_sql
         run: |
           SERVER="${{ steps.names.outputs.sql_server }}"
+          DB="${{ env.SQL_DATABASE }}"
+
+          # Verificar si el servidor ya existe
           EXISTS=$(az sql server show \
             --name "$SERVER" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --query "name" -o tsv 2>/dev/null || true)
 
-          if [ -z "$EXISTS" ]; then
-            echo "Creando SQL Server: ${SERVER}"
-            az sql server create \
-              --name            "$SERVER" \
-              --resource-group  "${{ env.RESOURCE_GROUP }}" \
-              --location        "${{ env.LOCATION }}" \
-              --admin-user      "${{ env.SQL_ADMIN_USER }}" \
-              --admin-password  "${{ steps.password.outputs.value }}" \
-              --output json
-          else
+          if [ -n "$EXISTS" ]; then
             echo "SQL Server ya existe: ${SERVER}"
+            LOC=$(az sql server show \
+              --name "$SERVER" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --query "location" -o tsv 2>/dev/null || echo "eastus")
+            echo "resolved_location=${LOC}" >> $GITHUB_OUTPUT
+            exit 0
           fi
 
-      # ── Azure SQL Database (Free tier, fallback Basic) ──────
-      - name: Crear Base de Datos
-        run: |
-          SERVER="${{ steps.names.outputs.sql_server }}"
-          DB="${{ env.SQL_DATABASE }}"
-          EXISTS=$(az sql db show \
-            --name "$DB" \
-            --server "$SERVER" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "name" -o tsv 2>/dev/null || true)
+          # Obtener regiones permitidas por la politica de la suscripcion
+          echo "Obteniendo regiones permitidas por la suscripcion..."
+          ALLOWED_REGIONS=$(az account list-locations \
+            --query "[].name" -o tsv 2>/dev/null | tr '\n' ' ')
+          echo "Regiones disponibles: ${ALLOWED_REGIONS}"
 
-          if [ -z "$EXISTS" ]; then
-            echo "Creando base de datos: ${DB}"
-            if az sql db create \
-              --name           "$DB" \
-              --server         "$SERVER" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --edition        "Free" \
-              --output json 2>&1; then
-              echo "Base de datos creada con tier Free"
-            else
-              echo "Free tier no disponible, usando Basic..."
-              az sql db create \
-                --name              "$DB" \
-                --server            "$SERVER" \
-                --resource-group    "${{ env.RESOURCE_GROUP }}" \
-                --edition           "Basic" \
-                --service-objective "Basic" \
-                --max-size          "2GB" \
-                --output json
-              echo "Base de datos creada con tier Basic"
+          # Orden de preferencia (Azure SQL tiene cobertura amplia)
+          PREFERRED=("eastus" "eastus2" "westus" "westus2" "centralus" \
+                     "southcentralus" "northcentralus" "westcentralus" \
+                     "northeurope" "westeurope" "uksouth" "ukwest" \
+                     "southeastasia" "eastasia" "japaneast" "japanwest" \
+                     "australiaeast" "australiasoutheast" \
+                     "brazilsouth" "canadacentral" "canadaeast" \
+                     "koreacentral" "koreasouth" "francecentral" \
+                     "germanywestcentral" "norwayeast" "switzerlandnorth")
+
+          CREATED=false
+
+          for REGION in "${PREFERRED[@]}"; do
+            # Solo intentar si la region esta permitida
+            if ! echo "$ALLOWED_REGIONS" | grep -qw "$REGION"; then
+              echo "Saltando ${REGION} (no permitida por politica)"
+              continue
             fi
-          else
-            echo "Base de datos ya existe: ${DB}"
+
+            echo ""
+            echo ">>> Intentando region: ${REGION}"
+
+            # Crear/actualizar resource group en esta region
+            az group create \
+              --name     "${{ env.RESOURCE_GROUP }}" \
+              --location "${REGION}" \
+              --output none 2>/dev/null || true
+
+            # Intentar crear el SQL Server
+            if az sql server create \
+              --name            "$SERVER" \
+              --resource-group  "${{ env.RESOURCE_GROUP }}" \
+              --location        "${REGION}" \
+              --admin-user      "${{ env.SQL_ADMIN_USER }}" \
+              --admin-password  "${{ steps.password.outputs.value }}" \
+              --output json 2>&1; then
+
+              echo "SQL Server creado en ${REGION}"
+              echo "resolved_location=${REGION}" >> $GITHUB_OUTPUT
+
+              # Crear la base de datos (Free primero, fallback Basic)
+              if az sql db create \
+                --name           "$DB" \
+                --server         "$SERVER" \
+                --resource-group "${{ env.RESOURCE_GROUP }}" \
+                --edition        "Free" \
+                --output json 2>&1; then
+                echo "Base de datos creada con tier Free"
+              else
+                echo "Free tier no disponible, usando Basic..."
+                az sql db create \
+                  --name              "$DB" \
+                  --server            "$SERVER" \
+                  --resource-group    "${{ env.RESOURCE_GROUP }}" \
+                  --edition           "Basic" \
+                  --service-objective "Basic" \
+                  --max-size          "2GB" \
+                  --output json
+                echo "Base de datos creada con tier Basic"
+              fi
+
+              CREATED=true
+              break
+            else
+              echo "    Fallo en ${REGION}, probando siguiente..."
+              # Limpiar servidor si quedo a medias
+              az sql server delete \
+                --name "$SERVER" \
+                --resource-group "${{ env.RESOURCE_GROUP }}" \
+                --yes 2>/dev/null || true
+            fi
+          done
+
+          if [ "$CREATED" = false ]; then
+            echo ""
+            echo "ERROR: No se pudo crear el servidor SQL en ninguna region permitida."
+            echo "Regiones intentadas: ${PREFERRED[*]}"
+            echo "Regiones permitidas por la suscripcion: ${ALLOWED_REGIONS}"
+            exit 1
           fi
 
       # ── FQDN del servidor ───────────────────────────────────
