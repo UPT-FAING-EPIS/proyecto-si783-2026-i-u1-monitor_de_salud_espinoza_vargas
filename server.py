@@ -13,7 +13,12 @@ import configparser
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import psutil
+try:
+    import psutil
+    _PSUTIL_OK = True
+except Exception:
+    psutil = None  # type: ignore
+    _PSUTIL_OK = False
 from flask import Flask, jsonify, render_template, g
 from flask_cors import CORS
 
@@ -171,26 +176,22 @@ def collect_real_metrics() -> dict:
     db_size_mb = round(SQLITE_PATH.stat().st_size / 1024 / 1024, 3) if SQLITE_PATH.exists() else 0.0
 
     # ── 2. psutil — metricas reales del proceso y host ───────
-    cpu_pct   = _proc.cpu_percent(interval=None)          # % CPU del proceso
-    mem_info  = _proc.memory_info()
-    mem_mb    = round(mem_info.rss / 1024 / 1024, 1)     # RAM usada (MB)
-    mem_vms_mb= round(mem_info.vms / 1024 / 1024, 1)
-
-    disk      = psutil.disk_usage(str(SQLITE_PATH.parent))
-    disk_used_pct = disk.percent
-
-    host_cpu  = psutil.cpu_percent(interval=None)         # % CPU del host
-    host_mem  = psutil.virtual_memory()
-    host_mem_pct = host_mem.percent
-
-    threads_os = _proc.num_threads()                      # hilos reales del proceso
-
     try:
-        net = psutil.net_io_counters()
+        cpu_pct      = _proc.cpu_percent(interval=None)
+        mem_info     = _proc.memory_info()
+        mem_mb       = round(mem_info.rss / 1024 / 1024, 1)
+        threads_os   = _proc.num_threads()
+        disk         = psutil.disk_usage(str(SQLITE_PATH.parent))
+        disk_used_pct= disk.percent
+        host_cpu     = psutil.cpu_percent(interval=None)
+        host_mem     = psutil.virtual_memory()
+        host_mem_pct = host_mem.percent
+        net          = psutil.net_io_counters()
         net_bytes_sent = net.bytes_sent
         net_bytes_recv = net.bytes_recv
     except Exception:
-        net_bytes_sent = net_bytes_recv = 0
+        cpu_pct = mem_mb = threads_os = disk_used_pct = 0.0
+        host_cpu = host_mem_pct = net_bytes_sent = net_bytes_recv = 0
 
     # ── 3. Contadores internos (queries HTTP, SQL) ────────────
     with _stats_lock:
@@ -399,13 +400,16 @@ def background_collector():
     save_every = max(1, 60 // refresh)
     tick       = 0
 
-    # Primer llamado a cpu_percent calienta el contador (devuelve 0.0)
-    _proc.cpu_percent(interval=None)
-    psutil.cpu_percent(interval=None)
-    time.sleep(1)
+    # Primer llamado a cpu_percent calienta el contador internamente
+    # (lo hacemos dentro del hilo, sin bloquear gunicorn)
+    _cpu_warmed = False
 
     while True:
         try:
+            if not _cpu_warmed and _PSUTIL_OK:
+                _proc.cpu_percent(interval=None)
+                psutil.cpu_percent(interval=None)
+                _cpu_warmed = True
             metrics = collect_real_metrics()
             alerts  = evaluate_alerts(metrics, cfg)
 

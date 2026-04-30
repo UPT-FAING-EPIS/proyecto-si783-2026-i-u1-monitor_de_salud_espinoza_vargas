@@ -15,6 +15,7 @@ on:
 
 env:
   RESOURCE_GROUP: rg-db-health-monitor
+  LOCATION: centralus
 
 # ══════════════════════════════════════════════════════════════
 jobs:
@@ -71,6 +72,7 @@ jobs:
 
           # Regiones en orden de prioridad para suscripciones Student
           REGIONS=(
+            "centralus"
             "swedencentral"
             "northeurope"
             "westeurope"
@@ -89,7 +91,6 @@ jobs:
             "eastus"
             "eastus2"
             "westus2"
-            "centralus"
             "southcentralus"
           )
 
@@ -170,7 +171,7 @@ jobs:
           az webapp config set \
             --name           "${{ steps.names.outputs.webapp }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=2 server:app" \
+            --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=1 --timeout=120 --preload server:app" \
             --output none
 
       # ── Deploy ───────────────────────────────────────────────
