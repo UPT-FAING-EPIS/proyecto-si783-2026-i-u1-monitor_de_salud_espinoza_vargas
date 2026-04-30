@@ -14,10 +14,10 @@ on:
 
 env:
   RESOURCE_GROUP: rg-mysql-health-monitor
-  LOCATION: eastus2
+  LOCATION: eastus
   MYSQL_ADMIN_USER: mysqladmin
   MYSQL_VERSION: "8.0.21"
-  MYSQL_SKU: Standard_B1s
+  MYSQL_SKU: Standard_B2s
   MYSQL_TIER: Burstable
   MYSQL_STORAGE_GB: 32
 
