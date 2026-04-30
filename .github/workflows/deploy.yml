@@ -14,10 +14,10 @@ on:
 
 env:
   RESOURCE_GROUP: rg-mysql-health-monitor
-  LOCATION: eastus
+  LOCATION: eastus2
   MYSQL_ADMIN_USER: mysqladmin
   MYSQL_VERSION: "8.0.21"
-  MYSQL_SKU: Standard_B1ms
+  MYSQL_SKU: Standard_B1s
   MYSQL_TIER: Burstable
   MYSQL_STORAGE_GB: 32
 
@@ -25,7 +25,7 @@ env:
 jobs:
 
 # ──────────────────────────────────────────────────────────────
-# JOB 1 — Infraestructura + Base de Datos
+# JOB 1 — Infraestructura + Base de Datosa
 # ──────────────────────────────────────────────────────────────
   provision-database:
     name: "1 · Infraestructura y Base de Datos"
