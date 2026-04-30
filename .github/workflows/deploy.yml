@@ -1,8 +1,8 @@
 # ══════════════════════════════════════════════════════════════
 #  DB Health Monitor — Deploy to Azure (Azure SQL Database)
 #  Secretos necesarios en GitHub:
-#    AZURE_CREDENTIALS        → JSON del Service Principal de Azure
-#    AZURE_SUBSCRIPTION_ID   → ID de tu suscripción Azure
+#    AZURE_CREDENTIALS       -> JSON del Service Principal de Azure
+#    AZURE_SUBSCRIPTION_ID  -> ID de tu suscripcion Azure
 # ══════════════════════════════════════════════════════════════
 
 name: Deploy DB Health Monitor to Azure
@@ -13,11 +13,7 @@ on:
   workflow_dispatch:
 
 env:
-<<<<<<< HEAD
   RESOURCE_GROUP: rg-db-health-monitor
-=======
-  RESOURCE_GROUP: rg-mysql-health-monitor-eus
->>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
   LOCATION: eastus
   SQL_ADMIN_USER: sqladmin
   SQL_DATABASE: db_health_monitor
@@ -26,14 +22,10 @@ env:
 jobs:
 
 # ──────────────────────────────────────────────────────────────
-<<<<<<< HEAD
-# JOB 1 — Infraestructura + Base de Datos (Azure SQL Database)
-=======
-# JOB 1 — Infraestructura + Base de Datosa
->>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
+# JOB 1 - Infraestructura + Base de Datos (Azure SQL Database)
 # ──────────────────────────────────────────────────────────────
   provision-database:
-    name: "1 · Infraestructura y Base de Datos"
+    name: "1 - Infraestructura y Base de Datos"
     runs-on: ubuntu-latest
 
     outputs:
@@ -43,7 +35,7 @@ jobs:
     steps:
 
       # ── Checkout ────────────────────────────────────────────
-      - name: Checkout código
+      - name: Checkout codigo
         uses: actions/checkout@v4
 
       # ── Login Azure ─────────────────────────────────────────
@@ -52,50 +44,27 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Establecer suscripción
+      - name: Establecer suscripcion
         run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
 
-<<<<<<< HEAD
       # ── Registrar proveedor Microsoft.Sql ───────────────────
       - name: Registrar proveedor Microsoft.Sql
         run: |
           az provider register --namespace Microsoft.Sql
           sleep 10
 
-      # ── Limpiar Resource Group anterior ────────────────────
+      # ── Limpiar Resource Group anterior ─────────────────────
       - name: Eliminar Resource Group anterior
         run: |
-=======
-      # ── Registrar namespace Microsoft.DBforMySQL ─────────────
-      - name: Registrar proveedor Microsoft.DBforMySQL
-        run: |
-          echo "Registrando namespace Microsoft.DBforMySQL..."
-          az provider register --namespace Microsoft.DBforMySQL
-          echo "Esperando a que se registre el namespace..."
-          sleep 10
-
-      # ── Limpiar Resource Group anterior (si existe) ────────
-      - name: Eliminar Resource Group anterior
-        run: |
-          echo "Intentando eliminar resource group anterior..."
->>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
           az group delete \
             --name "${{ env.RESOURCE_GROUP }}" \
             --yes \
             --no-wait \
-<<<<<<< HEAD
-            2>/dev/null || echo "Resource group no existía"
+            2>/dev/null || echo "Resource group no existia"
           echo "Esperando limpieza (60s)..."
           sleep 60
 
-      # ── Nombres únicos (deterministas) ──────────────────────
-=======
-            2>/dev/null || echo "Resource group no existía o ya fue eliminado"
-          echo "Esperando a que se limpie completamente (60 segundos)..."
-          sleep 60
-
-      # ── Nombres únicos (deterministas por subscription) ─────
->>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
+      # ── Nombres unicos (deterministas) ──────────────────────
       - name: Generar nombres de recursos
         id: names
         run: |
@@ -105,8 +74,8 @@ jobs:
           echo "plan=asp-db-monitor-${SUFFIX}"      >> $GITHUB_OUTPUT
           echo "suffix=${SUFFIX}"                    >> $GITHUB_OUTPUT
 
-      # ── Contraseña SQL (determinista, enmascarada) ──────────
-      - name: Generar contraseña SQL
+      # ── Contrasena SQL (determinista, enmascarada) ──────────
+      - name: Generar contrasena SQL
         id: password
         run: |
           HASH=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}-sql-salt-2024" \
@@ -115,35 +84,23 @@ jobs:
           echo "::add-mask::${PASS}"
           echo "value=${PASS}" >> $GITHUB_OUTPUT
 
-      # ── Resource Group inicial ──────────────────────────────
-      - name: Crear Resource Group inicial
+      # ── Resource Group ──────────────────────────────────────
+      - name: Crear Resource Group
         run: |
           az group create \
             --name     "${{ env.RESOURCE_GROUP }}" \
             --location "${{ env.LOCATION }}" \
             --output none
 
-<<<<<<< HEAD
       # ── Azure SQL Server ────────────────────────────────────
       - name: Crear Azure SQL Server (si no existe)
         run: |
           SERVER="${{ steps.names.outputs.sql_server }}"
           EXISTS=$(az sql server show \
-=======
-      # ── MySQL Flexible Server (auto-región + auto-SKU) ──────
-      - name: Crear Azure MySQL Flexible Server (auto-región)
-        id: create_mysql
-        run: |
-          SERVER="${{ steps.names.outputs.mysql_server }}"
-
-          # Verificar si ya existe
-          EXISTS=$(az mysql flexible-server show \
->>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
             --name "$SERVER" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --query "name" -o tsv 2>/dev/null || true)
 
-<<<<<<< HEAD
           if [ -z "$EXISTS" ]; then
             echo "Creando SQL Server: ${SERVER}"
             az sql server create \
@@ -157,8 +114,8 @@ jobs:
             echo "SQL Server ya existe: ${SERVER}"
           fi
 
-      # ── Azure SQL Database (Free serverless tier) ───────────
-      - name: Crear Base de Datos (Free tier)
+      # ── Azure SQL Database (Free tier, fallback Basic) ──────
+      - name: Crear Base de Datos
         run: |
           SERVER="${{ steps.names.outputs.sql_server }}"
           DB="${{ env.SQL_DATABASE }}"
@@ -170,97 +127,27 @@ jobs:
 
           if [ -z "$EXISTS" ]; then
             echo "Creando base de datos: ${DB}"
-            # Intentar Free tier primero, si falla usar Basic
             if az sql db create \
               --name           "$DB" \
               --server         "$SERVER" \
               --resource-group "${{ env.RESOURCE_GROUP }}" \
               --edition        "Free" \
               --output json 2>&1; then
-              echo "✔ Base de datos creada con tier Free"
+              echo "Base de datos creada con tier Free"
             else
               echo "Free tier no disponible, usando Basic..."
               az sql db create \
-                --name           "$DB" \
-                --server         "$SERVER" \
-                --resource-group "${{ env.RESOURCE_GROUP }}" \
-                --edition        "Basic" \
+                --name              "$DB" \
+                --server            "$SERVER" \
+                --resource-group    "${{ env.RESOURCE_GROUP }}" \
+                --edition           "Basic" \
                 --service-objective "Basic" \
-                --max-size       "2GB" \
+                --max-size          "2GB" \
                 --output json
-              echo "✔ Base de datos creada con tier Basic"
+              echo "Base de datos creada con tier Basic"
             fi
           else
             echo "Base de datos ya existe: ${DB}"
-=======
-          if [ -n "$EXISTS" ]; then
-            echo "Servidor MySQL ya existe: ${SERVER}"
-            USED_LOC=$(az mysql flexible-server show \
-              --name "$SERVER" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --query "location" -o tsv 2>/dev/null || echo "${{ env.LOCATION }}")
-            echo "resolved_location=${USED_LOC}" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          # Regiones a intentar (orden de disponibilidad general)
-          REGIONS=("eastus" "eastus2" "westus2" "centralus" "westus" \
-                   "northeurope" "westeurope" "southeastasia" \
-                   "australiaeast" "brazilsouth" "canadacentral" \
-                   "japaneast" "koreacentral")
-
-          # SKUs Burstable a intentar
-          SKUS=("Standard_B1ms" "Standard_B2s" "Standard_B2ms" "Standard_B4ms")
-
-          CREATED=false
-
-          for REGION in "${REGIONS[@]}"; do
-            echo ""
-            echo ">>> Intentando región: ${REGION}"
-
-            # Reubicar el resource group en esta región
-            az group create \
-              --name    "${{ env.RESOURCE_GROUP }}" \
-              --location "${REGION}" \
-              --output none 2>/dev/null || true
-
-            for SKU in "${SKUS[@]}"; do
-              echo "    SKU: ${SKU} (Burstable)"
-
-              if az mysql flexible-server create \
-                --name            "$SERVER" \
-                --resource-group  "${{ env.RESOURCE_GROUP }}" \
-                --location        "${REGION}" \
-                --admin-user      "${{ env.MYSQL_ADMIN_USER }}" \
-                --admin-password  "${{ steps.password.outputs.value }}" \
-                --sku-name        "${SKU}" \
-                --tier            "Burstable" \
-                --version         "${{ env.MYSQL_VERSION }}" \
-                --storage-size    "${{ env.MYSQL_STORAGE_GB }}" \
-                --public-access   "0.0.0.0" \
-                --output json 2>&1; then
-                echo ""
-                echo "✔ Servidor creado: región=${REGION} SKU=${SKU}"
-                echo "resolved_location=${REGION}" >> $GITHUB_OUTPUT
-                CREATED=true
-                break 2
-              else
-                echo "    ✗ Falló ${SKU} en ${REGION}"
-                # Limpiar si quedó a medias
-                az mysql flexible-server delete \
-                  --name "$SERVER" \
-                  --resource-group "${{ env.RESOURCE_GROUP }}" \
-                  --yes 2>/dev/null || true
-              fi
-            done
-          done
-
-          if [ "$CREATED" = false ]; then
-            echo ""
-            echo "ERROR: No se pudo crear el servidor en ninguna región/SKU disponible."
-            echo "Verifica la cuota de tu suscripción en Azure Portal > Subscriptions > Usage + quotas"
-            exit 1
->>>>>>> fc41ef706d7ca05d762d4e91c3ccfd64b0982fd5
           fi
 
       # ── FQDN del servidor ───────────────────────────────────
@@ -280,9 +167,9 @@ jobs:
           RUNNER_IP=$(curl -sf https://api.ipify.org)
           echo "Runner IP: ${RUNNER_IP}"
           az sql server firewall-rule create \
-            --server         "${{ steps.names.outputs.sql_server }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --name           "gha-runner-temp" \
+            --server           "${{ steps.names.outputs.sql_server }}" \
+            --resource-group   "${{ env.RESOURCE_GROUP }}" \
+            --name             "gha-runner-temp" \
             --start-ip-address "$RUNNER_IP" \
             --end-ip-address   "$RUNNER_IP" \
             --output none
@@ -292,14 +179,13 @@ jobs:
         run: |
           curl -sSL https://packages.microsoft.com/keys/microsoft.asc \
             | sudo gpg --dearmor -o /usr/share/keyrings/microsoft.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] \
-            https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft.gpg] https://packages.microsoft.com/ubuntu/22.04/prod jammy main" \
             | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update -q
           sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
           echo "/opt/mssql-tools18/bin" >> $GITHUB_PATH
 
-      # ── Ejecutar script SQL de configuración ────────────────
+      # ── Ejecutar script SQL de configuracion ────────────────
       - name: Ejecutar db_health_setup.sql
         run: |
           sqlcmd \
@@ -323,17 +209,17 @@ jobs:
 
 
 # ──────────────────────────────────────────────────────────────
-# JOB 2 — Despliegue de la aplicación Flask
+# JOB 2 - Despliegue de la aplicacion Flask
 # ──────────────────────────────────────────────────────────────
   deploy-app:
-    name: "2 · Despliegue Flask en App Service"
+    name: "2 - Despliegue Flask en App Service"
     runs-on: ubuntu-latest
     needs: provision-database
 
     steps:
 
       # ── Checkout ────────────────────────────────────────────
-      - name: Checkout código
+      - name: Checkout codigo
         uses: actions/checkout@v4
 
       # ── Login Azure ─────────────────────────────────────────
@@ -342,7 +228,7 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Establecer suscripción
+      - name: Establecer suscripcion
         run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
 
       # ── Mismos nombres deterministas ────────────────────────
@@ -350,12 +236,12 @@ jobs:
         id: names
         run: |
           SUFFIX=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | sha256sum | cut -c1-10)
-          echo "webapp=db-monitor-${SUFFIX}"       >> $GITHUB_OUTPUT
-          echo "plan=asp-db-monitor-${SUFFIX}"     >> $GITHUB_OUTPUT
-          echo "sql_server=sql-monitor-${SUFFIX}"  >> $GITHUB_OUTPUT
+          echo "webapp=db-monitor-${SUFFIX}"      >> $GITHUB_OUTPUT
+          echo "plan=asp-db-monitor-${SUFFIX}"    >> $GITHUB_OUTPUT
+          echo "sql_server=sql-monitor-${SUFFIX}" >> $GITHUB_OUTPUT
 
-      # ── Misma contraseña determinista ───────────────────────
-      - name: Regenerar contraseña SQL
+      # ── Misma contrasena determinista ───────────────────────
+      - name: Regenerar contrasena SQL
         id: password
         run: |
           HASH=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}-sql-salt-2024" \
@@ -429,8 +315,8 @@ jobs:
             --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=2 server:app" \
             --output none
 
-      # ── Deploy del código ────────────────────────────────────
-      - name: Desplegar aplicación
+      # ── Deploy del codigo ────────────────────────────────────
+      - name: Desplegar aplicacion
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ steps.names.outputs.webapp }}
@@ -448,9 +334,9 @@ jobs:
           IDX=0
           for IP in "${IPS[@]}"; do
             az sql server firewall-rule create \
-              --server         "${{ steps.names.outputs.sql_server }}" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --name           "webapp-ip-${IDX}" \
+              --server           "${{ steps.names.outputs.sql_server }}" \
+              --resource-group   "${{ env.RESOURCE_GROUP }}" \
+              --name             "webapp-ip-${IDX}" \
               --start-ip-address "$IP" \
               --end-ip-address   "$IP" \
               --output none 2>/dev/null || true
