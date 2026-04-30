@@ -13,8 +13,8 @@ on:
   workflow_dispatch:
 
 env:
-  RESOURCE_GROUP: rg-mysql-health-monitor-westus
-  LOCATION: westus
+  RESOURCE_GROUP: rg-mysql-health-monitor-ncu
+  LOCATION: northcentralus
   MYSQL_ADMIN_USER: mysqladmin
   MYSQL_VERSION: "8.0.21"
   MYSQL_SKU: Standard_B1s
