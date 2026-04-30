@@ -88,47 +88,93 @@ jobs:
           echo "::add-mask::${PASS}"
           echo "value=${PASS}" >> $GITHUB_OUTPUT
 
-      # ── Resource Group ──────────────────────────────────────
-      - name: Crear Resource Group
+      # ── Resource Group inicial ──────────────────────────────
+      - name: Crear Resource Group inicial
         run: |
           az group create \
             --name    "${{ env.RESOURCE_GROUP }}" \
             --location "${{ env.LOCATION }}" \
             --output none
-      # ── Diagnosticar SKUs disponibles ────────────────────
-      - name: Listar SKUs disponibles en la región
-        run: |
-          echo "SKUs disponibles en ${{ env.LOCATION }}:"
-          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json | jq '.[] | select(.supportedFlexibleServerEditions[].name=="Burstable") | .name' 2>/dev/null || \
-          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json | jq '.[].name' | head -20 || true
-          echo ""
-          echo "Tier Burstable disponible:"
-          az mysql flexible-server list-skus --location "${{ env.LOCATION }}" -o json 2>/dev/null | head -c 2000 || true
-      # ── MySQL Flexible Server ───────────────────────────────
-      - name: Crear Azure MySQL Flexible Server (si no existe)
+
+      # ── MySQL Flexible Server (auto-región + auto-SKU) ──────
+      - name: Crear Azure MySQL Flexible Server (auto-región)
+        id: create_mysql
         run: |
           SERVER="${{ steps.names.outputs.mysql_server }}"
+
+          # Verificar si ya existe
           EXISTS=$(az mysql flexible-server show \
             --name "$SERVER" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --query "name" -o tsv 2>/dev/null || true)
 
-          if [ -z "$EXISTS" ]; then
-            echo "Creando servidor MySQL: ${SERVER}"
-            az mysql flexible-server create \
-              --name            "$SERVER" \
-              --resource-group  "${{ env.RESOURCE_GROUP }}" \
-              --location        "${{ env.LOCATION }}" \
-              --admin-user      "${{ env.MYSQL_ADMIN_USER }}" \
-              --admin-password  "${{ steps.password.outputs.value }}" \
-              --sku-name        "${{ env.MYSQL_SKU }}" \
-              --tier            "${{ env.MYSQL_TIER }}" \
-              --version         "${{ env.MYSQL_VERSION }}" \
-              --storage-size    "${{ env.MYSQL_STORAGE_GB }}" \
-              --public-access   "0.0.0.0" \
-              --output json
-          else
+          if [ -n "$EXISTS" ]; then
             echo "Servidor MySQL ya existe: ${SERVER}"
+            USED_LOC=$(az mysql flexible-server show \
+              --name "$SERVER" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --query "location" -o tsv 2>/dev/null || echo "${{ env.LOCATION }}")
+            echo "resolved_location=${USED_LOC}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Regiones a intentar (orden de disponibilidad general)
+          REGIONS=("eastus" "eastus2" "westus2" "centralus" "westus" \
+                   "northeurope" "westeurope" "southeastasia" \
+                   "australiaeast" "brazilsouth" "canadacentral" \
+                   "japaneast" "koreacentral")
+
+          # SKUs Burstable a intentar
+          SKUS=("Standard_B1ms" "Standard_B2s" "Standard_B2ms" "Standard_B4ms")
+
+          CREATED=false
+
+          for REGION in "${REGIONS[@]}"; do
+            echo ""
+            echo ">>> Intentando región: ${REGION}"
+
+            # Reubicar el resource group en esta región
+            az group create \
+              --name    "${{ env.RESOURCE_GROUP }}" \
+              --location "${REGION}" \
+              --output none 2>/dev/null || true
+
+            for SKU in "${SKUS[@]}"; do
+              echo "    SKU: ${SKU} (Burstable)"
+
+              if az mysql flexible-server create \
+                --name            "$SERVER" \
+                --resource-group  "${{ env.RESOURCE_GROUP }}" \
+                --location        "${REGION}" \
+                --admin-user      "${{ env.MYSQL_ADMIN_USER }}" \
+                --admin-password  "${{ steps.password.outputs.value }}" \
+                --sku-name        "${SKU}" \
+                --tier            "Burstable" \
+                --version         "${{ env.MYSQL_VERSION }}" \
+                --storage-size    "${{ env.MYSQL_STORAGE_GB }}" \
+                --public-access   "0.0.0.0" \
+                --output json 2>&1; then
+                echo ""
+                echo "✔ Servidor creado: región=${REGION} SKU=${SKU}"
+                echo "resolved_location=${REGION}" >> $GITHUB_OUTPUT
+                CREATED=true
+                break 2
+              else
+                echo "    ✗ Falló ${SKU} en ${REGION}"
+                # Limpiar si quedó a medias
+                az mysql flexible-server delete \
+                  --name "$SERVER" \
+                  --resource-group "${{ env.RESOURCE_GROUP }}" \
+                  --yes 2>/dev/null || true
+              fi
+            done
+          done
+
+          if [ "$CREATED" = false ]; then
+            echo ""
+            echo "ERROR: No se pudo crear el servidor en ninguna región/SKU disponible."
+            echo "Verifica la cuota de tu suscripción en Azure Portal > Subscriptions > Usage + quotas"
+            exit 1
           fi
 
       # ── FQDN del servidor ───────────────────────────────────
