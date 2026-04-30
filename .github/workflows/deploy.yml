@@ -29,8 +29,9 @@ jobs:
     runs-on: ubuntu-latest
 
     outputs:
-      sql_server_fqdn: ${{ steps.get_fqdn.outputs.fqdn }}
-      sql_server_name: ${{ steps.names.outputs.sql_server }}
+      sql_server_fqdn:    ${{ steps.get_fqdn.outputs.fqdn }}
+      sql_server_name:    ${{ steps.names.outputs.sql_server }}
+      resolved_location:  ${{ steps.create_sql.outputs.resolved_location }}
 
     steps:
 
@@ -298,16 +299,19 @@ jobs:
       - name: Crear App Service Plan (si no existe)
         run: |
           PLAN="${{ steps.names.outputs.plan }}"
+          # Usar la misma region donde se creo el SQL Server
+          REGION="${{ needs.provision-database.outputs.resolved_location }}"
           EXISTS=$(az appservice plan show \
             --name "$PLAN" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --query "name" -o tsv 2>/dev/null || true)
 
           if [ -z "$EXISTS" ]; then
+            echo "Creando App Service Plan en region: ${REGION}"
             az appservice plan create \
               --name           "$PLAN" \
               --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --location       "${{ env.LOCATION }}" \
+              --location       "${REGION}" \
               --sku            B1 \
               --is-linux \
               --output none
