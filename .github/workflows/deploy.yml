@@ -4,7 +4,7 @@
 #  Secretos necesarios en GitHub:
 #    AZURE_CREDENTIALS      -> JSON del Service Principal
 #    AZURE_SUBSCRIPTION_ID -> ID de tu suscripcion Azure
-#    POSTGRES_PASSWORD     -> Contraseña admin de PostgreSQL
+#  (La contraseña de PostgreSQL se genera automaticamente)
 # ══════════════════════════════════════════════════════════════
 
 name: Deploy DB Health Monitor to Azure
@@ -41,7 +41,7 @@ jobs:
       - name: Establecer suscripcion
         run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
 
-      # ── Nombres deterministas ────────────────────────────────
+      # ── Nombres deterministas + contraseña auto-generada ────────
       - name: Generar nombres de recursos
         id: names
         run: |
@@ -50,6 +50,12 @@ jobs:
           echo "plan=asp-db-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
           echo "pgserver=pg-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
           echo "suffix=${SUFFIX}"                >> $GITHUB_OUTPUT
+
+          # Contraseña determinista: siempre igual para la misma suscripcion,
+          # cumple requisitos Azure (mayus + minus + numero + especial, 20+ chars)
+          HASH=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}pg-salt-2026" | sha256sum | cut -c1-14)
+          PG_PASS="Db${HASH}Az1!"
+          echo "pg_pass=${PG_PASS}" >> $GITHUB_OUTPUT
 
       # ── App Service Plan (auto-region) ───────────────────────
       - name: Crear Resource Group y App Service Plan
@@ -142,7 +148,7 @@ jobs:
               --resource-group "${{ env.RESOURCE_GROUP }}" \
               --location       "${REGION}" \
               --admin-user     "${{ env.PG_ADMIN_USER }}" \
-              --admin-password "${{ secrets.POSTGRES_PASSWORD }}" \
+              --admin-password "${{ steps.names.outputs.pg_pass }}" \
               --sku-name       "Standard_B1ms" \
               --tier           "Burstable" \
               --public-access  "0.0.0.0" \
@@ -188,7 +194,8 @@ jobs:
       - name: Configurar App Settings
         run: |
           PG_HOST="${{ steps.postgres.outputs.pg_host }}"
-          DB_URL="postgresql://${{ env.PG_ADMIN_USER }}:${{ secrets.POSTGRES_PASSWORD }}@${PG_HOST}/${{ env.PG_DB_NAME }}?sslmode=require"
+          PG_PASS="${{ steps.names.outputs.pg_pass }}"
+          DB_URL="postgresql://${{ env.PG_ADMIN_USER }}:${PG_PASS}@${PG_HOST}/${{ env.PG_DB_NAME }}?sslmode=require"
 
           az webapp config appsettings set \
             --name           "${{ steps.names.outputs.webapp }}" \
