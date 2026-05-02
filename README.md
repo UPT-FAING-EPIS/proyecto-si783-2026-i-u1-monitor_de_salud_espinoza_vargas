@@ -120,17 +120,11 @@ Archivos clave
 - `templates/index.html` — interfaz web.
 - `static/` — recursos JS/CSS (dashboard.js, style.css).
 
-Licencia
-- Añade aquí la licencia que quieras usar (no incluida en el repositorio).
-
-Contacto
-- Autor: equipo / estudiante — ajustar según corresponda.
-
 --
 Este README fue generado para ofrecer una guía completa de instalación y
-uso del sistema. Si quieres, puedo añadir instrucciones específicas de
-despliegue en Docker, pasos para pruebas unitarias o un archivo
+uso del sistema.
 `config.ini` de ejemplo.
+
 [![Review Assignment Due Date](https://classroom.github.com/assets/deadline-readme-button-22041afd0340ce965d47ae6ef1cefeee28c7c493a6346c4f15d667ab976d596c.svg)](https://classroom.github.com/a/O8I-PXKI)
 [![Open in Codespaces](https://classroom.github.com/assets/launch-codespace-2972f46106e565e64193e422d61a12cf1da4916b45550586e14ef0a7c637dd04.svg)](https://classroom.github.com/open-in-codespaces?assignment_repo_id=23223050)
 # proyecto-formatos-01
