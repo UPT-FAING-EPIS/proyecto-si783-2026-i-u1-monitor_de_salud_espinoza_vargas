@@ -44,7 +44,12 @@ BASE_DIR     = Path(__file__).parent
 CONFIG_FILE  = BASE_DIR / "config.ini"
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 
-_proc = psutil.Process() if _PSUTIL_OK else None
+try:
+    _proc = psutil.Process() if _PSUTIL_OK else None
+except Exception as e:
+    _proc = None
+    _PSUTIL_OK = False
+    log.warning(f"No se pudo inicializar psutil.Process: {e}")
 
 # ─── Contadores globales ──────────────────────────────────────
 _stats = {
