@@ -1,9 +1,10 @@
 # ══════════════════════════════════════════════════════════════
 #  DB Health Monitor — Deploy to Azure App Service
-#  Base de datos: SQLite embebido (sin dependencias externas)
+#  Base de datos: Azure Database for PostgreSQL Flexible Server
 #  Secretos necesarios en GitHub:
-#    AZURE_CREDENTIALS       -> JSON del Service Principal
-#    AZURE_SUBSCRIPTION_ID  -> ID de tu suscripcion Azure
+#    AZURE_CREDENTIALS      -> JSON del Service Principal
+#    AZURE_SUBSCRIPTION_ID -> ID de tu suscripcion Azure
+#    POSTGRES_PASSWORD     -> Contraseña admin de PostgreSQL
 # ══════════════════════════════════════════════════════════════
 
 name: Deploy DB Health Monitor to Azure
@@ -15,7 +16,8 @@ on:
 
 env:
   RESOURCE_GROUP: rg-db-health-monitor
-  LOCATION: centralus
+  PG_ADMIN_USER:  dbadmin
+  PG_DB_NAME:     dbmonitor
 
 # ══════════════════════════════════════════════════════════════
 jobs:
@@ -46,15 +48,15 @@ jobs:
           SUFFIX=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | sha256sum | cut -c1-10)
           echo "webapp=db-monitor-${SUFFIX}"     >> $GITHUB_OUTPUT
           echo "plan=asp-db-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
-          echo "suffix=${SUFFIX}"                 >> $GITHUB_OUTPUT
+          echo "pgserver=pg-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
+          echo "suffix=${SUFFIX}"                >> $GITHUB_OUTPUT
 
       # ── App Service Plan (auto-region) ───────────────────────
-      - name: Crear Resource Group y App Service Plan (auto-region)
+      - name: Crear Resource Group y App Service Plan
         id: infra
         run: |
           PLAN="${{ steps.names.outputs.plan }}"
 
-          # Verificar si ya existe
           EXISTS=$(az appservice plan show \
             --name "$PLAN" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
@@ -65,48 +67,26 @@ jobs:
             LOC=$(az appservice plan show \
               --name "$PLAN" \
               --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --query "location" -o tsv 2>/dev/null || echo "swedencentral")
+              --query "location" -o tsv 2>/dev/null || echo "centralus")
             echo "resolved_location=${LOC}" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          # Regiones en orden de prioridad para suscripciones Student
           REGIONS=(
-            "centralus"
-            "swedencentral"
-            "northeurope"
-            "westeurope"
-            "uksouth"
-            "francecentral"
-            "germanywestcentral"
-            "norwayeast"
-            "switzerlandnorth"
-            "australiaeast"
-            "southeastasia"
-            "centralindia"
-            "japaneast"
-            "koreacentral"
-            "canadacentral"
-            "brazilsouth"
-            "eastus"
-            "eastus2"
-            "westus2"
-            "southcentralus"
+            "centralus" "swedencentral" "northeurope" "westeurope"
+            "uksouth" "francecentral" "germanywestcentral"
+            "australiaeast" "southeastasia" "centralindia"
+            "japaneast" "canadacentral" "eastus" "eastus2"
           )
 
           CREATED=false
-
           for REGION in "${REGIONS[@]}"; do
-            echo ""
             echo ">>> Intentando region: ${REGION}"
-
-            # Crear resource group en esta region
             az group create \
               --name     "${{ env.RESOURCE_GROUP }}" \
               --location "${REGION}" \
               --output none 2>/dev/null || true
 
-            # Intentar crear App Service Plan con timeout
             if timeout 120 az appservice plan create \
               --name           "$PLAN" \
               --resource-group "${{ env.RESOURCE_GROUP }}" \
@@ -114,12 +94,11 @@ jobs:
               --sku            B1 \
               --is-linux \
               --output none 2>&1; then
-              echo "App Service Plan creado en: ${REGION}"
+              echo "Plan creado en: ${REGION}"
               echo "resolved_location=${REGION}" >> $GITHUB_OUTPUT
               CREATED=true
               break
             else
-              echo "    Fallo o timeout en ${REGION}, siguiente..."
               az appservice plan delete \
                 --name "$PLAN" \
                 --resource-group "${{ env.RESOURCE_GROUP }}" \
@@ -128,9 +107,49 @@ jobs:
           done
 
           if [ "$CREATED" = false ]; then
-            echo "ERROR: No se pudo crear el App Service Plan en ninguna region."
+            echo "ERROR: No se pudo crear el App Service Plan."
             exit 1
           fi
+
+      # ── PostgreSQL Flexible Server ───────────────────────────
+      - name: Crear PostgreSQL Flexible Server (si no existe)
+        id: postgres
+        run: |
+          PG="${{ steps.names.outputs.pgserver }}"
+          REGION="${{ steps.infra.outputs.resolved_location }}"
+
+          EXISTS=$(az postgres flexible-server show \
+            --name "$PG" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --query "name" -o tsv 2>/dev/null || true)
+
+          if [ -z "$EXISTS" ]; then
+            echo "Creando PostgreSQL server: ${PG} en ${REGION}..."
+            az postgres flexible-server create \
+              --name           "$PG" \
+              --resource-group "${{ env.RESOURCE_GROUP }}" \
+              --location       "${REGION}" \
+              --admin-user     "${{ env.PG_ADMIN_USER }}" \
+              --admin-password "${{ secrets.POSTGRES_PASSWORD }}" \
+              --sku-name       "Standard_B1ms" \
+              --tier           "Burstable" \
+              --public-access  "0.0.0.0" \
+              --storage-size   32 \
+              --version        16 \
+              --output none
+            echo "PostgreSQL server creado: ${PG}"
+          else
+            echo "PostgreSQL server ya existe: ${PG}"
+          fi
+
+          # Crear base de datos si no existe
+          az postgres flexible-server db create \
+            --server-name    "$PG" \
+            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --database-name  "${{ env.PG_DB_NAME }}" \
+            --output none 2>/dev/null || true
+
+          echo "pg_host=${PG}.postgres.database.azure.com" >> $GITHUB_OUTPUT
 
       # ── Web App ──────────────────────────────────────────────
       - name: Crear Web App (si no existe)
@@ -156,14 +175,18 @@ jobs:
       # ── App Settings ─────────────────────────────────────────
       - name: Configurar App Settings
         run: |
+          PG_HOST="${{ steps.postgres.outputs.pg_host }}"
+          DB_URL="postgresql://${{ env.PG_ADMIN_USER }}:${{ secrets.POSTGRES_PASSWORD }}@${PG_HOST}/${{ env.PG_DB_NAME }}?sslmode=require"
+
           az webapp config appsettings set \
             --name           "${{ steps.names.outputs.webapp }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --settings \
-              SQLITE_PATH="/home/db_health.db" \
+              DATABASE_URL="${DB_URL}" \
+              PGHOST="${PG_HOST}" \
+              PGDATABASE="${{ env.PG_DB_NAME }}" \
               WEBSITES_PORT="5000" \
               SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
-              WEBSITES_ENABLE_APP_SERVICE_STORAGE="true" \
             --output none
 
       # ── Startup command ──────────────────────────────────────
@@ -172,7 +195,7 @@ jobs:
           az webapp config set \
             --name           "${{ steps.names.outputs.webapp }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=1 --threads=2 --timeout=300 --graceful-timeout=30 server:app" \
+            --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=1 --threads=2 --timeout=120 server:app" \
             --output none
 
       # ── Deploy ───────────────────────────────────────────────
@@ -182,16 +205,16 @@ jobs:
           app-name: ${{ steps.names.outputs.webapp }}
           package: .
 
-      # ── Health check post-deploy ────────────────────────────────
+      # ── Health check post-deploy ─────────────────────────────
       - name: Verificar despliegue (health check)
         run: |
           APP_URL="https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
           echo "Esperando que la app arranque..."
-          for i in $(seq 1 15); do
+          for i in $(seq 1 18); do
             HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${APP_URL}/api/health" || echo "000")
-            echo "  Intento ${i}/15 — HTTP ${HTTP_CODE}"
-            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "202" ]; then
-              echo "✔ App respondiendo correctamente (HTTP ${HTTP_CODE})"
+            echo "  Intento ${i}/18 — HTTP ${HTTP_CODE}"
+            if [ "$HTTP_CODE" = "200" ]; then
+              echo "✔ App respondiendo correctamente"
               break
             fi
             sleep 10
