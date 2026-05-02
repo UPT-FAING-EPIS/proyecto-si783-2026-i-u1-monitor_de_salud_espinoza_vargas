@@ -424,6 +424,10 @@ def background_collector():
     tick       = 0
     cpu_warmed = False
 
+    # Inicializar BD en segundo plano para no bloquear el arranque de la app
+    log.info("Iniciando conexión a base de datos en segundo plano...")
+    init_db(retries=20, delay=15.0)
+
     while True:
         try:
             if not cpu_warmed and _PSUTIL_OK and _proc is not None:
@@ -574,7 +578,6 @@ def startup():
     log.info("=== DB Health Monitor (PostgreSQL) arrancando ===")
     log.info("DATABASE_URL host: %s",
              DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else "(no configurada)")
-    init_db()
     t = threading.Thread(target=background_collector, daemon=True)
     t.start()
     log.info("Hilo de recolección iniciado.")
