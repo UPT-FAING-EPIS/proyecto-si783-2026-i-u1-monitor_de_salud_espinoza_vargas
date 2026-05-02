@@ -19,16 +19,58 @@ try:
 except Exception:
     psutil = None  # type: ignore
     _PSUTIL_OK = False
+import logging
 from flask import Flask, jsonify, render_template, g
 from flask_cors import CORS
 
 # ─────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("db_monitor")
+
 app = Flask(__name__, static_folder="static", template_folder="templates")
 CORS(app)
 
 BASE_DIR    = Path(__file__).parent
 CONFIG_FILE = BASE_DIR / "config.ini"
-SQLITE_PATH = Path(os.environ.get("SQLITE_PATH", str(BASE_DIR / "db_health.db")))
+
+
+def _resolve_sqlite_path() -> Path:
+    """
+    Resuelve la ruta del archivo SQLite en este orden de prioridad:
+      1. Variable de entorno SQLITE_PATH  (configurada en Azure App Settings)
+      2. /home/db_health.db              (almacenamiento persistente de Azure)
+      3. /tmp/db_health.db               (fallback efímero — funciona siempre)
+    Devuelve la primera ruta cuyo directorio padre sea escribible.
+    """
+    candidates = [
+        os.environ.get("SQLITE_PATH"),          # prioridad máxima
+        "/home/db_health.db",                   # persistente en Azure
+        "/tmp/db_health.db",                    # fallback universal
+        str(BASE_DIR / "db_health.db"),         # desarrollo local
+    ]
+    for raw in candidates:
+        if not raw:
+            continue
+        p = Path(raw)
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            # Prueba de escritura rápida
+            test_file = p.parent / ".write_test"
+            test_file.write_text("ok")
+            test_file.unlink()
+            log.info("SQLite path resuelto: %s", p)
+            return p
+        except Exception as e:
+            log.warning("Ruta no escribible '%s': %s — probando siguiente...", raw, e)
+    # Último recurso absoluto
+    log.error("No se encontró ninguna ruta escribible. Usando memoria volátil.")
+    return Path("/tmp/db_health_fallback.db")
+
+
+SQLITE_PATH = _resolve_sqlite_path()
 
 # ─── Contadores globales REALES ───────────────────────────────
 _stats = {
@@ -84,11 +126,13 @@ def execute_tracked(conn: sqlite3.Connection, sql: str, params=()):
     return cur
 
 
-def init_db():
-    """Crea el schema si no existe."""
-    SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = get_db()
-    conn.executescript("""
+def init_db(retries: int = 5, delay: float = 2.0):
+    """
+    Crea el schema SQLite si no existe.
+    Reintenta hasta `retries` veces con `delay` segundos entre intentos
+    para tolerar que Azure tarde en montar /home al primer arranque.
+    """
+    schema = """
         CREATE TABLE IF NOT EXISTS health_snapshots (
             id                              INTEGER PRIMARY KEY AUTOINCREMENT,
             captured_at                     TEXT    NOT NULL DEFAULT (datetime('now')),
@@ -126,9 +170,40 @@ def init_db():
 
         CREATE INDEX IF NOT EXISTS idx_snap_at   ON health_snapshots (captured_at DESC);
         CREATE INDEX IF NOT EXISTS idx_alert_at  ON alert_log        (alerted_at  DESC);
-    """)
-    conn.commit()
-    conn.close()
+    """
+    for attempt in range(1, retries + 1):
+        try:
+            SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            conn = get_db()
+            conn.executescript(schema)
+            conn.commit()
+            conn.close()
+            log.info("Base de datos inicializada correctamente en: %s", SQLITE_PATH)
+            return
+        except Exception as e:
+            log.warning(
+                "init_db intento %d/%d falló: %s. Reintentando en %.0fs...",
+                attempt, retries, e, delay,
+            )
+            if attempt < retries:
+                time.sleep(delay)
+
+    # Si todos los intentos fallaron, intenta con /tmp como último recurso
+    global SQLITE_PATH  # noqa: PLW0603
+    if "/tmp" not in str(SQLITE_PATH):
+        log.error(
+            "Todos los intentos de init_db fallaron. "
+            "Cambiando a /tmp/db_health_fallback.db (datos no persistentes)."
+        )
+        SQLITE_PATH = Path("/tmp/db_health_fallback.db")
+        try:
+            conn = get_db()
+            conn.executescript(schema)
+            conn.commit()
+            conn.close()
+            log.info("Base de datos de emergencia lista en: %s", SQLITE_PATH)
+        except Exception as e:
+            log.error("No se pudo inicializar ninguna BD: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -529,12 +604,32 @@ def api_config():
 
 
 # ─────────────────────────────────────────────────────────────
+# HEALTH CHECK (Azure App Service lo sondea automáticamente)
+# ─────────────────────────────────────────────────────────────
+@app.route("/api/health")
+def api_health():
+    """Endpoint rápido para el health-check de Azure (no toca SQLite)."""
+    with _cache_lock:
+        ok = _cache["metrics"] is not None
+        err = _cache["error"]
+    status_code = 200 if ok else 202  # 202 = todavía arrancando
+    return jsonify({
+        "status":   "ok" if ok else "starting",
+        "db_path":  str(SQLITE_PATH),
+        "error":    err,
+    }), status_code
+
+
+# ─────────────────────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def startup():
+    log.info("=== DB Health Monitor arrancando ===")
+    log.info("SQLite path activo: %s", SQLITE_PATH)
     init_db()
     t = threading.Thread(target=background_collector, daemon=True)
     t.start()
+    log.info("Hilo de recolección iniciado.")
 
 
 if __name__ == "__main__":

@@ -163,6 +163,7 @@ jobs:
               SQLITE_PATH="/home/db_health.db" \
               WEBSITES_PORT="5000" \
               SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
+              WEBSITES_ENABLE_APP_SERVICE_STORAGE="true" \
             --output none
 
       # ── Startup command ──────────────────────────────────────
@@ -171,7 +172,7 @@ jobs:
           az webapp config set \
             --name           "${{ steps.names.outputs.webapp }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=1 --timeout=120 --preload server:app" \
+            --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=1 --timeout=300 --graceful-timeout=30 --preload server:app" \
             --output none
 
       # ── Deploy ───────────────────────────────────────────────
@@ -180,6 +181,21 @@ jobs:
         with:
           app-name: ${{ steps.names.outputs.webapp }}
           package: .
+
+      # ── Health check post-deploy ────────────────────────────────
+      - name: Verificar despliegue (health check)
+        run: |
+          APP_URL="https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
+          echo "Esperando que la app arranque..."
+          for i in $(seq 1 15); do
+            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${APP_URL}/api/health" || echo "000")
+            echo "  Intento ${i}/15 — HTTP ${HTTP_CODE}"
+            if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "202" ]; then
+              echo "✔ App respondiendo correctamente (HTTP ${HTTP_CODE})"
+              break
+            fi
+            sleep 10
+          done
 
       # ── URL final ────────────────────────────────────────────
       - name: Mostrar URL del dashboard
