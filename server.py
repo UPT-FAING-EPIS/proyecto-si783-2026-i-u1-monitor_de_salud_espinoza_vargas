@@ -209,7 +209,7 @@ def init_db(retries: int = 5, delay: float = 2.0):
 # ─────────────────────────────────────────────────────────────
 # RECOLECCION DE METRICAS REALES
 # ─────────────────────────────────────────────────────────────
-_proc = psutil.Process()   # proceso Python actual
+_proc = psutil.Process() if _PSUTIL_OK else None   # proceso Python actual
 
 def collect_real_metrics() -> dict:
     """
@@ -252,18 +252,21 @@ def collect_real_metrics() -> dict:
 
     # ── 2. psutil — metricas reales del proceso y host ───────
     try:
-        cpu_pct      = _proc.cpu_percent(interval=None)
-        mem_info     = _proc.memory_info()
-        mem_mb       = round(mem_info.rss / 1024 / 1024, 1)
-        threads_os   = _proc.num_threads()
-        disk         = psutil.disk_usage(str(SQLITE_PATH.parent))
-        disk_used_pct= disk.percent
-        host_cpu     = psutil.cpu_percent(interval=None)
-        host_mem     = psutil.virtual_memory()
-        host_mem_pct = host_mem.percent
-        net          = psutil.net_io_counters()
-        net_bytes_sent = net.bytes_sent
-        net_bytes_recv = net.bytes_recv
+        if _PSUTIL_OK and _proc is not None:
+            cpu_pct      = _proc.cpu_percent(interval=None)
+            mem_info     = _proc.memory_info()
+            mem_mb       = round(mem_info.rss / 1024 / 1024, 1)
+            threads_os   = _proc.num_threads()
+            disk         = psutil.disk_usage(str(SQLITE_PATH.parent))
+            disk_used_pct= disk.percent
+            host_cpu     = psutil.cpu_percent(interval=None)
+            host_mem     = psutil.virtual_memory()
+            host_mem_pct = host_mem.percent
+            net          = psutil.net_io_counters()
+            net_bytes_sent = net.bytes_sent
+            net_bytes_recv = net.bytes_recv
+        else:
+            raise RuntimeError("psutil no disponible")
     except Exception:
         cpu_pct = mem_mb = threads_os = disk_used_pct = 0.0
         host_cpu = host_mem_pct = net_bytes_sent = net_bytes_recv = 0
@@ -481,7 +484,7 @@ def background_collector():
 
     while True:
         try:
-            if not _cpu_warmed and _PSUTIL_OK:
+            if not _cpu_warmed and _PSUTIL_OK and _proc is not None:
                 _proc.cpu_percent(interval=None)
                 psutil.cpu_percent(interval=None)
                 _cpu_warmed = True
