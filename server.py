@@ -23,8 +23,12 @@ except Exception:
 try:
     import psycopg2
     import psycopg2.extras
-except ImportError:
-    raise RuntimeError("psycopg2-binary no instalado. Ejecuta: pip install psycopg2-binary")
+    _PSYCOPG2_OK = True
+    _PSYCOPG2_ERR = None
+except ImportError as e:
+    psycopg2 = None
+    _PSYCOPG2_OK = False
+    _PSYCOPG2_ERR = str(e)
 
 from flask import Flask, jsonify, render_template
 from flask_cors import CORS
@@ -73,6 +77,8 @@ def load_config() -> configparser.ConfigParser:
 # ─────────────────────────────────────────────────────────────
 def get_db():
     """Devuelve una conexión psycopg2 a PostgreSQL."""
+    if not _PSYCOPG2_OK:
+        raise RuntimeError(f"psycopg2 no disponible: {_PSYCOPG2_ERR}")
     if not DATABASE_URL:
         raise RuntimeError("DATABASE_URL no está configurada.")
     return psycopg2.connect(DATABASE_URL)
@@ -483,7 +489,10 @@ def index():
 
 @app.route("/api/health")
 def api_health():
-    """Health check para Azure — responde 200 siempre que Flask esté vivo."""
+    """Health check para Azure."""
+    if not _PSYCOPG2_OK:
+        return {"status": "error", "error": f"ImportError: {_PSYCOPG2_ERR}"}, 500
+
     with _cache_lock:
         ok  = _cache["metrics"] is not None
         err = _cache["error"]
