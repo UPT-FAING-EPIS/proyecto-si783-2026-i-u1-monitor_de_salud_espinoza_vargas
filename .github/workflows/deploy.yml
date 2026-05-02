@@ -111,6 +111,18 @@ jobs:
             exit 1
           fi
 
+      # ── Registrar proveedor PostgreSQL ──────────────────────
+      - name: Registrar proveedor Microsoft.DBforPostgreSQL
+        run: |
+          STATE=$(az provider show --namespace Microsoft.DBforPostgreSQL --query "registrationState" -o tsv 2>/dev/null || echo "NotRegistered")
+          if [ "$STATE" != "Registered" ]; then
+            echo "Registrando Microsoft.DBforPostgreSQL (puede tardar ~2 min)..."
+            az provider register --namespace Microsoft.DBforPostgreSQL --wait
+            echo "✔ Proveedor registrado."
+          else
+            echo "✔ Microsoft.DBforPostgreSQL ya estaba registrado."
+          fi
+
       # ── PostgreSQL Flexible Server ───────────────────────────
       - name: Crear PostgreSQL Flexible Server (si no existe)
         id: postgres
