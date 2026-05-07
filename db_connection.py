@@ -6,18 +6,33 @@ import logging
 import configparser
 from pathlib import Path
 
-import mysql.connector
-from mysql.connector import pooling
+# ── MySQL driver (opcional) ──────────────────────────────────────────────────
+try:
+    import mysql.connector
+    from mysql.connector import pooling as mysql_pooling
+    _MYSQL_OK = True
+except ImportError:
+    mysql = None
+    mysql_pooling = None
+    _MYSQL_OK = False
 
+# ── PostgreSQL driver — psycopg2 preferido, psycopg3 como fallback ────────────
 try:
     import psycopg2
     import psycopg2.pool
     import psycopg2.extras
     _PG_DRIVER = "psycopg2"
+    _PG_OK = True
 except ImportError:
-    import psycopg
-    from psycopg.rows import dict_row
-    _PG_DRIVER = "psycopg"
+    psycopg2 = None
+    try:
+        import psycopg
+        from psycopg.rows import dict_row as _pg3_dict_row
+        _PG_DRIVER = "psycopg3"
+        _PG_OK = True
+    except ImportError:
+        _PG_DRIVER = None
+        _PG_OK = False
 
 logger = logging.getLogger(__name__)
 CONFIG_FILE = Path(__file__).parent / "config.ini"
@@ -62,6 +77,8 @@ def init_pool(pool_name: str = "health_monitor_pool", pool_size: int = 5):
     primary = cfg.get("database", "primary_db", fallback="mysql").lower()
 
     if primary == "postgresql":
+        if not _PG_OK:
+            raise RuntimeError("Ningún driver PostgreSQL disponible (psycopg2/psycopg3).")
         pg = get_postgres_config()
         _db_type = "postgresql"
         if _PG_DRIVER == "psycopg2":
@@ -79,9 +96,11 @@ def init_pool(pool_name: str = "health_monitor_pool", pool_size: int = 5):
             _pool = {"config": pg}
         return True
 
+    if not _MYSQL_OK:
+        raise RuntimeError("Driver MySQL no disponible (mysql-connector-python).")
     my = get_mysql_config()
     _db_type = "mysql"
-    _pool = pooling.MySQLConnectionPool(
+    _pool = mysql_pooling.MySQLConnectionPool(
         pool_name=pool_name,
         pool_size=pool_size,
         pool_reset_session=True,
@@ -99,6 +118,7 @@ def get_connection():
         if _PG_DRIVER == "psycopg2":
             return _pool.getconn()
         pg = _pool["config"]
+        import psycopg
         return psycopg.connect(
             host=pg["host"],
             port=pg["port"],
@@ -120,7 +140,7 @@ def execute_query(sql: str, params=None) -> list:
             cur.close()
             _pool.putconn(conn)
             return rows
-        cur = conn.cursor(row_factory=dict_row)
+        cur = conn.cursor(row_factory=_pg3_dict_row)
         cur.execute(sql, params or ())
         rows = cur.fetchall()
         cur.close()

@@ -21,32 +21,21 @@ except Exception:
     psutil = None
     _PSUTIL_OK = False
 
-try:
-    import mysql.connector
-    _MYSQL_OK = True
-except ImportError:
-    mysql = None
-    _MYSQL_OK = False
 
 try:
     import psycopg2
     _PSYCOPG2_OK = True
     _PSYCOPG2_ERR = None
 except ImportError as e:
-    try:
-        import psycopg as psycopg2
-        _PSYCOPG2_OK = True
-        _PSYCOPG2_ERR = None
-    except ImportError:
-        psycopg2 = None
-        _PSYCOPG2_OK = False
-        _PSYCOPG2_ERR = str(e)
+    psycopg2 = None
+    _PSYCOPG2_OK = False
+    _PSYCOPG2_ERR = str(e)
 
 from flask import Flask, jsonify, render_template
 from flask_cors import CORS
 
 # Importar gestores de servicios y conexiones
-from db_connection import init_pool, get_connection, execute_query, test_connection as test_mysql_connection
+from db_connection import init_pool, get_connection, execute_query, test_connection as test_pg_connection
 from services import get_service_manager, get_connectivity_checker
 
 # ─────────────────────────────────────────────────────────────
