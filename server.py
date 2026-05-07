@@ -43,66 +43,85 @@ def cfg_bool(section, key, fallback=True):
 
 # ── DB Init ───────────────────────────────────────────────────────────────────
 
-INIT_SQL = """
-CREATE TABLE IF NOT EXISTS datasources (
-    id         SERIAL PRIMARY KEY,
-    nombre     VARCHAR(100) NOT NULL,
-    tipo_db    VARCHAR(20)  NOT NULL DEFAULT 'postgresql',
-    host       VARCHAR(255) NOT NULL,
-    puerto     INTEGER      NOT NULL DEFAULT 5432,
-    usuario    VARCHAR(100) NOT NULL,
-    password   TEXT         NOT NULL DEFAULT '',
-    database   VARCHAR(100) NOT NULL,
-    activa     BOOLEAN      NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS health_snapshots (
-    id               SERIAL PRIMARY KEY,
-    datasource_id    INTEGER REFERENCES datasources(id) ON DELETE CASCADE,
-    captured_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    max_connections  INTEGER NOT NULL DEFAULT 0,
-    threads_connected INTEGER NOT NULL DEFAULT 0,
-    threads_running  INTEGER NOT NULL DEFAULT 0,
-    connection_pct   REAL    NOT NULL DEFAULT 0,
-    qps              REAL    NOT NULL DEFAULT 0,
-    slow_queries     INTEGER NOT NULL DEFAULT 0,
-    cache_hit_ratio  REAL    NOT NULL DEFAULT 0,
-    db_size_mb       REAL    NOT NULL DEFAULT 0,
-    cpu_pct          REAL    NOT NULL DEFAULT 0,
-    mem_pct          REAL    NOT NULL DEFAULT 0,
-    status           VARCHAR(20) NOT NULL DEFAULT 'OK'
-);
-CREATE TABLE IF NOT EXISTS alert_log (
-    id            SERIAL PRIMARY KEY,
-    datasource_id INTEGER REFERENCES datasources(id) ON DELETE CASCADE,
-    alerted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    severity      VARCHAR(20) NOT NULL,
-    metric_name   VARCHAR(100) NOT NULL,
-    metric_value  VARCHAR(50) NOT NULL,
-    threshold     VARCHAR(100) NOT NULL,
-    message       TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS sql_imports (
-    id                SERIAL PRIMARY KEY,
-    datasource_id     INTEGER REFERENCES datasources(id) ON DELETE SET NULL,
-    filename          VARCHAR(255) NOT NULL,
-    uploaded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    status            VARCHAR(20)  NOT NULL DEFAULT 'pending',
-    statements_ok     INTEGER NOT NULL DEFAULT 0,
-    statements_failed INTEGER NOT NULL DEFAULT 0,
-    error_message     TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_snap_ds  ON health_snapshots (datasource_id, captured_at DESC);
-CREATE INDEX IF NOT EXISTS idx_alert_ds ON alert_log        (datasource_id, alerted_at  DESC);
-CREATE INDEX IF NOT EXISTS idx_imp_ds   ON sql_imports      (datasource_id, uploaded_at DESC);
-"""
+
+INIT_SQL = [
+    # 1. Tablas nuevas (si no existen)
+    """CREATE TABLE IF NOT EXISTS datasources (
+        id         SERIAL PRIMARY KEY,
+        nombre     VARCHAR(100) NOT NULL,
+        tipo_db    VARCHAR(20)  NOT NULL DEFAULT 'postgresql',
+        host       VARCHAR(255) NOT NULL,
+        puerto     INTEGER      NOT NULL DEFAULT 5432,
+        usuario    VARCHAR(100) NOT NULL,
+        password   TEXT         NOT NULL DEFAULT '',
+        database   VARCHAR(100) NOT NULL,
+        activa     BOOLEAN      NOT NULL DEFAULT TRUE,
+        created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    )""",
+    """CREATE TABLE IF NOT EXISTS health_snapshots (
+        id                SERIAL PRIMARY KEY,
+        datasource_id     INTEGER,
+        captured_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        max_connections   INTEGER NOT NULL DEFAULT 0,
+        threads_connected INTEGER NOT NULL DEFAULT 0,
+        threads_running   INTEGER NOT NULL DEFAULT 0,
+        connection_pct    REAL    NOT NULL DEFAULT 0,
+        qps               REAL    NOT NULL DEFAULT 0,
+        slow_queries      INTEGER NOT NULL DEFAULT 0,
+        cache_hit_ratio   REAL    NOT NULL DEFAULT 0,
+        db_size_mb        REAL    NOT NULL DEFAULT 0,
+        cpu_pct           REAL    NOT NULL DEFAULT 0,
+        mem_pct           REAL    NOT NULL DEFAULT 0,
+        status            VARCHAR(20) NOT NULL DEFAULT 'OK'
+    )""",
+    """CREATE TABLE IF NOT EXISTS alert_log (
+        id            SERIAL PRIMARY KEY,
+        datasource_id INTEGER,
+        alerted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        severity      VARCHAR(20) NOT NULL DEFAULT 'INFO',
+        metric_name   VARCHAR(100) NOT NULL DEFAULT '',
+        metric_value  VARCHAR(50) NOT NULL DEFAULT '',
+        threshold     VARCHAR(100) NOT NULL DEFAULT '',
+        message       TEXT NOT NULL DEFAULT ''
+    )""",
+    """CREATE TABLE IF NOT EXISTS sql_imports (
+        id                SERIAL PRIMARY KEY,
+        datasource_id     INTEGER,
+        filename          VARCHAR(255) NOT NULL,
+        uploaded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        status            VARCHAR(20)  NOT NULL DEFAULT 'pending',
+        statements_ok     INTEGER NOT NULL DEFAULT 0,
+        statements_failed INTEGER NOT NULL DEFAULT 0,
+        error_message     TEXT
+    )""",
+    # 2. Migración: columnas que pueden faltar en BD existente
+    "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS datasource_id INTEGER",
+    "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS cache_hit_ratio REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS db_size_mb REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS cpu_pct REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS mem_pct REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS qps REAL NOT NULL DEFAULT 0",
+    "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS slow_queries INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE alert_log ADD COLUMN IF NOT EXISTS datasource_id INTEGER",
+    # 3. Índices
+    "CREATE INDEX IF NOT EXISTS idx_snap_ds  ON health_snapshots (datasource_id, captured_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_alert_ds ON alert_log        (datasource_id, alerted_at  DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_imp_ds   ON sql_imports      (datasource_id, uploaded_at DESC)",
+]
+
 
 def init_db(retries=10, delay=6.0):
-    for i in range(retries):
+    for attempt in range(retries):
         try:
             conn = get_monitor_conn()
-            cur = conn.cursor()
-            cur.execute(INIT_SQL)
+            cur  = conn.cursor()
+            for stmt in INIT_SQL:
+                try:
+                    cur.execute(stmt)
+                    conn.commit()
+                except Exception as e:
+                    log.warning("init_db stmt skip: %s", str(e)[:120])
+                    conn.rollback()
             # Seed datasource principal si no hay ninguno
             cur.execute("SELECT COUNT(*) FROM datasources")
             if cur.fetchone()[0] == 0:
@@ -118,16 +137,17 @@ def init_db(retries=10, delay=6.0):
                     cfg.get("postgresql","password",fallback=""),
                     cfg.get("postgresql","database",fallback="db_health_monitor"),
                 ))
-            conn.commit(); cur.close()
+                conn.commit()
+            cur.close()
             release_conn(conn)
             log.info("Base de datos inicializada OK.")
             _initialized.set()
             return True
         except Exception as e:
-            log.warning("init_db intento %d/%d: %s", i+1, retries, e)
-            if i < retries-1: time.sleep(delay)
+            log.warning("init_db intento %d/%d: %s", attempt+1, retries, e)
+            if attempt < retries-1: time.sleep(delay)
     log.error("No se pudo inicializar la BD tras %d intentos.", retries)
-    _initialized.set()   # liberar para que la app responda aunque sea con error
+    _initialized.set()
     return False
 
 # ── Recolección de métricas ───────────────────────────────────────────────────
