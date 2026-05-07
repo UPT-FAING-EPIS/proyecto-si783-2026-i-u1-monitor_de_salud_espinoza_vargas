@@ -1,778 +1,648 @@
 #!/usr/bin/env python3
-"""
-Monitor de Salud DB — Backend Flask con MySQL/PostgreSQL.
-Métricas reales: Estado de BD + psutil (CPU/RAM/disco)
-+ Gestión de múltiples servicios y conectividad.
-"""
+"""Monitor de Salud DB — Flask + PostgreSQL + Multi-datasource + SQL Import."""
 
-import os
-import threading
-import time
-import logging
-import configparser
-from urllib.parse import quote_plus
+import os, re, threading, time, logging, configparser
 from datetime import datetime, timedelta
 from pathlib import Path
 
 try:
     import psutil
-    _PSUTIL_OK = True
+    _proc = psutil.Process()
+    _PSUTIL = True
 except Exception:
-    psutil = None
-    _PSUTIL_OK = False
+    psutil = None; _proc = None; _PSUTIL = False
 
-
-try:
-    import psycopg2
-    _PSYCOPG2_OK = True
-    _PSYCOPG2_ERR = None
-except ImportError as e:
-    psycopg2 = None
-    _PSYCOPG2_OK = False
-    _PSYCOPG2_ERR = str(e)
-
-from flask import Flask, jsonify, render_template
+import psycopg2, psycopg2.extras
+from flask import Flask, jsonify, render_template, request
 from flask_cors import CORS
+from db_connection import (
+    get_monitor_conn, release_conn, build_dsn,
+    connect_to_datasource, test_datasource, load_config
+)
 
-# Importar gestores de servicios y conexiones
-from db_connection import init_pool, get_connection, execute_query, test_connection as test_pg_connection
-from services import get_service_manager, get_connectivity_checker
-
-# ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("db_monitor")
+log = logging.getLogger("monitor")
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 CORS(app)
 
-BASE_DIR     = Path(__file__).parent
-CONFIG_FILE  = BASE_DIR / "config.ini"
-DATABASE_URL = ""
+BASE_DIR = Path(__file__).parent
+_initialized = threading.Event()
+_cache: dict = {}          # {ds_id: {"metrics": ..., "error": ..., "ts": ...}}
+_cache_lock = threading.Lock()
 
-# Inicializar gestores
-service_manager = get_service_manager()
-connectivity_checker = get_connectivity_checker()
+# ── Config helpers ────────────────────────────────────────────────────────────
 
-try:
-    _proc = psutil.Process() if _PSUTIL_OK else None
-except Exception as e:
-    _proc = None
-    _PSUTIL_OK = False
-    log.warning(f"No se pudo inicializar psutil.Process: {e}")
+def cfg_int(section, key, fallback):
+    try: return load_config().getint(section, key, fallback=fallback)
+    except: return fallback
 
-# ─── Contadores globales ──────────────────────────────────────
-_stats = {
-    "queries_total":   0,
-    "queries_slow":    0,
-    "requests_total":  0,
-    "requests_active": 0,
-    "start_time":      datetime.now(),
-}
-_stats_lock = threading.Lock()
+def cfg_bool(section, key, fallback=True):
+    try: return load_config().getboolean(section, key, fallback=fallback)
+    except: return fallback
 
-_cache: dict = {"metrics": None, "alerts": [], "error": None, "last_update": None}
-_cache_lock  = threading.Lock()
+# ── DB Init ───────────────────────────────────────────────────────────────────
 
-SLOW_QUERY_MS = 100
+INIT_SQL = """
+CREATE TABLE IF NOT EXISTS datasources (
+    id         SERIAL PRIMARY KEY,
+    nombre     VARCHAR(100) NOT NULL,
+    tipo_db    VARCHAR(20)  NOT NULL DEFAULT 'postgresql',
+    host       VARCHAR(255) NOT NULL,
+    puerto     INTEGER      NOT NULL DEFAULT 5432,
+    usuario    VARCHAR(100) NOT NULL,
+    password   TEXT         NOT NULL DEFAULT '',
+    database   VARCHAR(100) NOT NULL,
+    activa     BOOLEAN      NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS health_snapshots (
+    id               SERIAL PRIMARY KEY,
+    datasource_id    INTEGER REFERENCES datasources(id) ON DELETE CASCADE,
+    captured_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    max_connections  INTEGER NOT NULL DEFAULT 0,
+    threads_connected INTEGER NOT NULL DEFAULT 0,
+    threads_running  INTEGER NOT NULL DEFAULT 0,
+    connection_pct   REAL    NOT NULL DEFAULT 0,
+    qps              REAL    NOT NULL DEFAULT 0,
+    slow_queries     INTEGER NOT NULL DEFAULT 0,
+    cache_hit_ratio  REAL    NOT NULL DEFAULT 0,
+    db_size_mb       REAL    NOT NULL DEFAULT 0,
+    cpu_pct          REAL    NOT NULL DEFAULT 0,
+    mem_pct          REAL    NOT NULL DEFAULT 0,
+    status           VARCHAR(20) NOT NULL DEFAULT 'OK'
+);
+CREATE TABLE IF NOT EXISTS alert_log (
+    id            SERIAL PRIMARY KEY,
+    datasource_id INTEGER REFERENCES datasources(id) ON DELETE CASCADE,
+    alerted_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    severity      VARCHAR(20) NOT NULL,
+    metric_name   VARCHAR(100) NOT NULL,
+    metric_value  VARCHAR(50) NOT NULL,
+    threshold     VARCHAR(100) NOT NULL,
+    message       TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sql_imports (
+    id                SERIAL PRIMARY KEY,
+    datasource_id     INTEGER REFERENCES datasources(id) ON DELETE SET NULL,
+    filename          VARCHAR(255) NOT NULL,
+    uploaded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    status            VARCHAR(20)  NOT NULL DEFAULT 'pending',
+    statements_ok     INTEGER NOT NULL DEFAULT 0,
+    statements_failed INTEGER NOT NULL DEFAULT 0,
+    error_message     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_snap_ds  ON health_snapshots (datasource_id, captured_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alert_ds ON alert_log        (datasource_id, alerted_at  DESC);
+CREATE INDEX IF NOT EXISTS idx_imp_ds   ON sql_imports      (datasource_id, uploaded_at DESC);
+"""
 
-
-# ─────────────────────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────────────────────
-def load_config() -> configparser.ConfigParser:
-    cfg = configparser.ConfigParser()
-    if CONFIG_FILE.exists():
-        cfg.read(CONFIG_FILE, encoding="utf-8")
-    return cfg
-
-
-def resolve_database_url() -> str:
-    """Obtiene DATABASE_URL desde entorno o construye una usando config.ini."""
-    env_url = os.environ.get("DATABASE_URL", "").strip()
-    if env_url:
-        return env_url
-
-    cfg = load_config()
-    if not cfg.has_section("postgresql"):
-        return ""
-
-    host = cfg.get("postgresql", "host", fallback="").strip()
-    port = cfg.get("postgresql", "port", fallback="5432").strip()
-    user = cfg.get("postgresql", "user", fallback="").strip()
-    password = cfg.get("postgresql", "password", fallback="")
-    database = cfg.get("postgresql", "database", fallback="").strip()
-
-    if not host or not user or not database:
-        return ""
-
-    user_enc = quote_plus(user)
-    pass_enc = quote_plus(password)
-    return f"postgresql://{user_enc}:{pass_enc}@{host}:{port}/{database}"
-
-
-# ─────────────────────────────────────────────────────────────
-# POSTGRESQL — conexión con instrumentación
-# ─────────────────────────────────────────────────────────────
-def get_db():
-    """Devuelve una conexión psycopg2 a PostgreSQL."""
-    if not _PSYCOPG2_OK:
-        raise RuntimeError(f"psycopg2 no disponible: {_PSYCOPG2_ERR}")
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL no está configurada.")
-    return psycopg2.connect(DATABASE_URL)
-
-
-def execute_tracked(conn, sql: str, params=()):
-    """Ejecuta una query midiendo tiempo real e incrementa contadores."""
-    t0 = time.perf_counter()
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    elapsed_ms = (time.perf_counter() - t0) * 1000
-    with _stats_lock:
-        _stats["queries_total"] += 1
-        if elapsed_ms > SLOW_QUERY_MS:
-            _stats["queries_slow"] += 1
-    return cur
-
-
-def init_db(retries: int = 5, delay: float = 5.0):
-    """Crea las tablas si no existen. Reintenta para tolerar arranques lentos."""
-    stmts = [
-        """
-        CREATE TABLE IF NOT EXISTS health_snapshots (
-            id                              SERIAL      PRIMARY KEY,
-            captured_at                     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            max_connections                 INTEGER     NOT NULL DEFAULT 0,
-            threads_connected               INTEGER     NOT NULL DEFAULT 0,
-            threads_running                 INTEGER     NOT NULL DEFAULT 0,
-            threads_cached                  INTEGER     NOT NULL DEFAULT 0,
-            threads_created                 INTEGER     NOT NULL DEFAULT 0,
-            connection_pct                  REAL        NOT NULL DEFAULT 0.0,
-            questions                       INTEGER     NOT NULL DEFAULT 0,
-            qps                             REAL        NOT NULL DEFAULT 0.0,
-            slow_queries                    INTEGER     NOT NULL DEFAULT 0,
-            innodb_buffer_pool_size         BIGINT      NOT NULL DEFAULT 0,
-            innodb_buffer_pool_reads        INTEGER     NOT NULL DEFAULT 0,
-            innodb_buffer_pool_read_reqs    INTEGER     NOT NULL DEFAULT 0,
-            innodb_hit_ratio                REAL        NOT NULL DEFAULT 0.0,
-            innodb_buffer_pool_pages_total  INTEGER     NOT NULL DEFAULT 0,
-            innodb_buffer_pool_pages_free   INTEGER     NOT NULL DEFAULT 0,
-            innodb_buffer_pool_pages_dirty  INTEGER     NOT NULL DEFAULT 0,
-            uptime_seconds                  INTEGER     NOT NULL DEFAULT 0,
-            status                          VARCHAR(20) NOT NULL DEFAULT 'OK',
-            cpu_pct                         REAL        NOT NULL DEFAULT 0.0,
-            mem_mb                          REAL        NOT NULL DEFAULT 0.0
-        )
-        """,
-        """
-        CREATE TABLE IF NOT EXISTS alert_log (
-            id           SERIAL       PRIMARY KEY,
-            alerted_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-            severity     VARCHAR(20)  NOT NULL DEFAULT 'INFO',
-            metric_name  VARCHAR(100) NOT NULL,
-            metric_value VARCHAR(50)  NOT NULL,
-            threshold    VARCHAR(100) NOT NULL,
-            message      TEXT         NOT NULL
-        )
-        """,
-        "CREATE INDEX IF NOT EXISTS idx_snap_at  ON health_snapshots (captured_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_alert_at ON alert_log        (alerted_at  DESC)",
-    ]
-    for attempt in range(1, retries + 1):
+def init_db(retries=10, delay=6.0):
+    for i in range(retries):
         try:
-            conn = get_db()
-            cur  = conn.cursor()
-            for stmt in stmts:
-                cur.execute(stmt)
-            conn.commit()
-            cur.close()
-            conn.close()
-            db_host = DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else "?"
-            log.info("PostgreSQL inicializado: %s", db_host)
-            return
+            conn = get_monitor_conn()
+            cur = conn.cursor()
+            cur.execute(INIT_SQL)
+            # Seed datasource principal si no hay ninguno
+            cur.execute("SELECT COUNT(*) FROM datasources")
+            if cur.fetchone()[0] == 0:
+                cfg = load_config()
+                cur.execute("""
+                    INSERT INTO datasources (nombre, tipo_db, host, puerto, usuario, password, database)
+                    VALUES (%s,'postgresql',%s,%s,%s,%s,%s)
+                """, (
+                    "Monitor Principal (VM)",
+                    cfg.get("postgresql","host",fallback="38.250.116.71"),
+                    cfg.getint("postgresql","port",fallback=5432),
+                    cfg.get("postgresql","user",fallback="monitor"),
+                    cfg.get("postgresql","password",fallback=""),
+                    cfg.get("postgresql","database",fallback="db_health_monitor"),
+                ))
+            conn.commit(); cur.close()
+            release_conn(conn)
+            log.info("Base de datos inicializada OK.")
+            _initialized.set()
+            return True
         except Exception as e:
-            log.warning("init_db intento %d/%d falló: %s. Reintentando en %.0fs...", attempt, retries, e, delay)
-            if attempt < retries:
-                time.sleep(delay)
-    log.error("No se pudo inicializar PostgreSQL. Revisa DATABASE_URL.")
+            log.warning("init_db intento %d/%d: %s", i+1, retries, e)
+            if i < retries-1: time.sleep(delay)
+    log.error("No se pudo inicializar la BD tras %d intentos.", retries)
+    _initialized.set()   # liberar para que la app responda aunque sea con error
+    return False
 
+# ── Recolección de métricas ───────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# RECOLECCIÓN DE MÉTRICAS REALES
-# ─────────────────────────────────────────────────────────────
-def collect_real_metrics() -> dict:
-    """
-    Métricas reales de tres fuentes:
-      1. PostgreSQL pg_stat_database  — estado real de la BD
-      2. psutil                       — CPU, RAM, disco, red
-      3. Contadores internos          — queries HTTP, SQL
-    """
-    conn = get_db()
+def collect_pg_metrics(ds: dict) -> dict:
+    conn = connect_to_datasource(ds, timeout=8)
+    cur = conn.cursor()
 
-    # ── 1. pg_stat_database ──────────────────────────────────
-    cur = execute_tracked(conn, """
-        SELECT
-            blks_hit,
-            blks_read,
-            numbackends,
-            xact_commit,
-            xact_rollback,
-            tup_fetched,
-            tup_inserted,
-            tup_updated,
-            tup_deleted,
-            pg_database_size(datname) AS db_size_bytes
-        FROM pg_stat_database
-        WHERE datname = current_database()
+    cur.execute("""
+        SELECT blks_hit, blks_read, numbackends,
+               pg_database_size(datname) AS sz
+        FROM pg_stat_database WHERE datname = current_database()
     """)
-    row = cur.fetchone() or (0,) * 10
-    blks_hit, blks_read  = row[0] or 0, row[1] or 0
-    num_backends         = row[2] or 0
-    xact_commit          = row[3] or 0
-    tup_fetched          = row[5] or 0
-    tup_inserted, tup_updated, tup_deleted = row[6] or 0, row[7] or 0, row[8] or 0
-    db_size_bytes        = row[9] or 0
+    row = cur.fetchone() or (0,0,0,0)
+    blks_hit, blks_read, num_backends, db_size_bytes = row
+    total_blks = (blks_hit or 0) + (blks_read or 0)
+    cache_hit  = round((blks_hit/total_blks)*100, 2) if total_blks else 99.9
 
-    # Cache hit ratio real
-    total_blks      = blks_hit + blks_read
-    cache_hit_ratio = round(blks_hit * 100.0 / total_blks, 2) if total_blks > 0 else 99.9
+    cur.execute("SELECT setting::int FROM pg_settings WHERE name='max_connections'")
+    max_conn = (cur.fetchone() or [100])[0]
 
-    # Max connections del servidor
-    cur2 = execute_tracked(conn, "SELECT setting::integer FROM pg_settings WHERE name = 'max_connections'")
-    max_conn_db = (cur2.fetchone() or [100])[0]
+    cur.execute("SELECT count(*) FROM pg_stat_activity WHERE state='active' AND pid<>pg_backend_pid()")
+    active = (cur.fetchone() or [0])[0]
 
-    # Conexiones activas (excluyendo la propia)
-    cur3 = execute_tracked(conn, "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND pid <> pg_backend_pid()")
-    active_conn = (cur3.fetchone() or [0])[0]
+    cur.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type IS NOT NULL AND pid<>pg_backend_pid()")
+    waiting = (cur.fetchone() or [0])[0]
 
-    # Conexiones en espera (lock wait, etc.)
-    cur4 = execute_tracked(conn, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type IS NOT NULL AND pid <> pg_backend_pid()")
-    waiting_conn = (cur4.fetchone() or [0])[0]
+    cur.close(); conn.close()
 
-    # Block size para calcular "páginas"
-    cur5 = execute_tracked(conn, "SELECT current_setting('block_size')::integer")
-    block_size = (cur5.fetchone() or [8192])[0]
+    db_mb   = round((db_size_bytes or 0)/1024/1024, 2)
+    conn_pct= round(min(99.9, num_backends/max_conn*100), 2) if max_conn else 0
 
-    conn.close()
-
-    db_size_mb  = round(db_size_bytes / 1024 / 1024, 3)
-    page_count  = db_size_bytes // block_size if block_size > 0 else 0
-    conn_pct    = round(min(99.9, (num_backends / max_conn_db) * 100), 2) if max_conn_db > 0 else 0.0
-
-    # ── 2. psutil ─────────────────────────────────────────────
+    # psutil
+    cpu_pct = mem_pct = 0.0
     try:
-        if _PSUTIL_OK and _proc is not None:
-            cpu_pct       = _proc.cpu_percent(interval=None)
-            mem_info      = _proc.memory_info()
-            mem_mb        = round(mem_info.rss / 1024 / 1024, 1)
-            threads_os    = _proc.num_threads()
-            disk          = psutil.disk_usage(str(BASE_DIR))
-            disk_used_pct = disk.percent
-            host_cpu      = psutil.cpu_percent(interval=None)
-            host_mem      = psutil.virtual_memory()
-            host_mem_pct  = host_mem.percent
-            net           = psutil.net_io_counters()
-            net_sent      = net.bytes_sent
-            net_recv      = net.bytes_recv
-        else:
-            raise RuntimeError("psutil no disponible")
-    except Exception:
-        cpu_pct = mem_mb = disk_used_pct = 0.0
-        threads_os = host_cpu = host_mem_pct = net_sent = net_recv = 0
+        if _PSUTIL:
+            cpu_pct = psutil.cpu_percent(interval=None)
+            mem_pct = psutil.virtual_memory().percent
+    except Exception: pass
 
-    # ── 3. Contadores internos ────────────────────────────────
-    with _stats_lock:
-        queries_total  = _stats["queries_total"]
-        queries_slow   = _stats["queries_slow"]
-        requests_total = _stats["requests_total"]
-        req_active     = _stats["requests_active"]
-        start_time     = _stats["start_time"]
-
-    uptime_sec = int((datetime.now() - start_time).total_seconds())
-    qps        = round(queries_total / uptime_sec, 2) if uptime_sec > 0 else 0.0
-
-    td = timedelta(seconds=uptime_sec)
-    d, h, m, s = td.days, td.seconds // 3600, (td.seconds % 3600) // 60, td.seconds % 60
-    uptime_str = f"{d}d {h:02}h {m:02}m {s:02}s"
-
-    processes = []
-    try:
-        if _proc:
-            for t in _proc.threads()[:20]:
-                processes.append({
-                    "ID": t.id, "USER": "python",
-                    "HOST": os.environ.get("WEBSITE_HOSTNAME", "localhost"),
-                    "DB": "postgres", "COMMAND": "Thread",
-                    "TIME": int(t.system_time + t.user_time),
-                    "STATE": "running", "INFO": "",
-                })
-    except Exception:
-        pass
-
-    db_sizes = [{
-        "db_name": f"{os.environ.get('PGDATABASE', 'postgres')} (PostgreSQL)",
-        "size_mb": db_size_mb, "tables": 2,
-    }]
+    status = "OK"
+    if conn_pct >= 90 or cache_hit < 70: status = "CRITICAL"
+    elif conn_pct >= 70 or cache_hit < 85: status = "WARNING"
 
     return {
-        "timestamp":      datetime.now().isoformat(),
-        "version":        f"PostgreSQL ({os.environ.get('PGHOST', 'Azure')})",
-        "hostname":       os.environ.get("WEBSITE_HOSTNAME", "localhost"),
-        "uptime_seconds": uptime_sec,
-        "uptime_str":     uptime_str,
-        # Conexiones
-        "max_connections":   max_conn_db,
-        "threads_connected": num_backends,
-        "threads_running":   active_conn,
-        "threads_cached":    waiting_conn,
-        "threads_created":   threads_os,
-        "connection_pct":    conn_pct,
-        # Rendimiento
-        "questions":    queries_total,
-        "qps":          qps,
-        "slow_queries": queries_slow,
-        "com_select":   tup_fetched,
-        "com_insert":   tup_inserted,
-        "com_update":   tup_updated,
-        "com_delete":   tup_deleted,
-        # Buffer / Cache (PostgreSQL shared_buffers)
-        "innodb_hit_ratio": cache_hit_ratio,
-        "bp_size_mb":       db_size_mb,
-        "bp_used_pct":      min(99.9, round((db_size_bytes / max(db_size_bytes + 1, 1)) * 100, 1)),
-        "bp_pages_total":   page_count,
-        "bp_pages_free":    0,
-        "bp_pages_dirty":   0,
-        # Listas
-        "processes":   processes,
-        "db_sizes":    db_sizes,
-        "top_tables":  [],
-        "replication": None,
-        # Extra
-        "host_cpu_pct":    host_cpu,
-        "host_mem_pct":    host_mem_pct,
-        "process_cpu_pct": cpu_pct,
-        "process_mem_mb":  mem_mb,
-        "disk_used_pct":   disk_used_pct,
-        "net_bytes_sent":  net_sent,
-        "net_bytes_recv":  net_recv,
-        "db_size_mb":      db_size_mb,
-        "journal_mode":    "PostgreSQL WAL",
-        "page_size_bytes": block_size,
-        "cache_size_pages": page_count,
+        "datasource_id":    ds["id"],
+        "tipo_db":          "postgresql",
+        "timestamp":        datetime.now().isoformat(),
+        "max_connections":  max_conn,
+        "threads_connected":num_backends,
+        "threads_running":  active,
+        "threads_waiting":  waiting,
+        "connection_pct":   conn_pct,
+        "qps":              0.0,
+        "slow_queries":     0,
+        "cache_hit_ratio":  cache_hit,
+        "db_size_mb":       db_mb,
+        "cpu_pct":          cpu_pct,
+        "mem_pct":          mem_pct,
+        "status":           status,
     }
 
-
-def _overall_status(metrics: dict) -> str:
-    if metrics["connection_pct"] >= 90 or metrics["innodb_hit_ratio"] < 70:
-        return "CRITICAL"
-    if metrics["connection_pct"] >= 70 or metrics["innodb_hit_ratio"] < 85:
-        return "WARNING"
-    return "OK"
-
-
-# ─────────────────────────────────────────────────────────────
-# PERSISTENCIA EN POSTGRESQL
-# ─────────────────────────────────────────────────────────────
-def save_snapshot(metrics: dict):
-    conn = get_db()
+def save_snapshot(m: dict):
+    conn = get_monitor_conn()
     try:
-        execute_tracked(conn, """
-            INSERT INTO health_snapshots (
-                max_connections, threads_connected, threads_running, threads_cached,
-                threads_created, connection_pct, questions, qps, slow_queries,
-                innodb_buffer_pool_size, innodb_buffer_pool_reads,
-                innodb_buffer_pool_read_reqs, innodb_hit_ratio,
-                innodb_buffer_pool_pages_total, innodb_buffer_pool_pages_free,
-                innodb_buffer_pool_pages_dirty, uptime_seconds, status,
-                cpu_pct, mem_mb
-            ) VALUES (
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,
-                %s,%s,%s,%s,%s,
-                %s,%s
-            )
-        """, (
-            metrics["max_connections"],   metrics["threads_connected"],
-            metrics["threads_running"],   metrics["threads_cached"],
-            metrics["threads_created"],   metrics["connection_pct"],
-            metrics["questions"],         metrics["qps"],
-            metrics["slow_queries"],
-            int(metrics["bp_size_mb"] * 1024 * 1024), 0, metrics["questions"],
-            metrics["innodb_hit_ratio"],
-            metrics["bp_pages_total"],    metrics["bp_pages_free"],
-            metrics["bp_pages_dirty"],    metrics["uptime_seconds"],
-            _overall_status(metrics),
-            metrics["process_cpu_pct"],   metrics["process_mem_mb"],
-        ))
-        # Purgar snapshots antiguos
-        execute_tracked(conn, """
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO health_snapshots
+              (datasource_id, max_connections, threads_connected, threads_running,
+               connection_pct, qps, slow_queries, cache_hit_ratio,
+               db_size_mb, cpu_pct, mem_pct, status)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (m["datasource_id"], m["max_connections"], m["threads_connected"],
+              m["threads_running"], m["connection_pct"], m["qps"],
+              m["slow_queries"], m["cache_hit_ratio"], m["db_size_mb"],
+              m["cpu_pct"], m["mem_pct"], m["status"]))
+        cur.execute("""
             DELETE FROM health_snapshots
-            WHERE id NOT IN (
-                SELECT id FROM health_snapshots ORDER BY id DESC LIMIT 10000
+            WHERE datasource_id=%s AND id NOT IN (
+              SELECT id FROM health_snapshots
+              WHERE datasource_id=%s ORDER BY id DESC LIMIT 5000
             )
-        """)
-        conn.commit()
+        """, (m["datasource_id"], m["datasource_id"]))
+        conn.commit(); cur.close()
     finally:
-        conn.close()
+        release_conn(conn)
 
-
-def save_alerts(alerts: list):
-    if not alerts:
-        return
-    conn = get_db()
-    try:
-        for a in alerts:
-            execute_tracked(conn, """
-                INSERT INTO alert_log (severity, metric_name, metric_value, threshold, message)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (a["severity"], a["metric"], a["value"], a["threshold"],
-                  f"{a['metric']} = {a['value']} | umbral: {a['threshold']}"))
-        conn.commit()
-    finally:
-        conn.close()
-
-
-# ─────────────────────────────────────────────────────────────
-# ALERTAS
-# ─────────────────────────────────────────────────────────────
-def evaluate_alerts(metrics: dict, cfg) -> list:
-    def thr(k, d): return cfg.getfloat("thresholds", k, fallback=d)
+def evaluate_alerts(m: dict, cfg) -> list:
+    def t(k,d): return cfg.getfloat("thresholds",k,fallback=d)
     alerts = []
     checks = [
-        ("connection_pct",   metrics["connection_pct"],   thr("connections_warning", 70),  thr("connections_critical", 90),  "Uso de Conexiones",    "%",  False),
-        ("innodb_hit_ratio", metrics["innodb_hit_ratio"], thr("cache_hit_warning", 85),    thr("cache_hit_critical", 70),    "Cache Hit Ratio PG",   "%",  True),
-        ("threads_running",  metrics["threads_running"],  thr("threads_running_warning", 20), thr("threads_running_critical", 50), "Conexiones Activas", "", False),
-        ("slow_queries",     metrics["slow_queries"],     thr("slow_queries_warning", 10), thr("slow_queries_critical", 50), "Queries Lentas",       "",   False),
-        ("host_cpu_pct",     metrics["host_cpu_pct"],     thr("cpu_warning", 70),          thr("cpu_critical", 90),          "CPU Host",             "%",  False),
-        ("host_mem_pct",     metrics["host_mem_pct"],     thr("mem_warning", 80),          thr("mem_critical", 95),          "Memoria Host",         "%",  False),
+        ("connection_pct",  m["connection_pct"],  t("connections_warning",70), t("connections_critical",90), "Conexiones %",     False),
+        ("cache_hit_ratio", m["cache_hit_ratio"],  t("cache_hit_warning",85),  t("cache_hit_critical",70),   "Cache Hit Ratio %", True),
+        ("cpu_pct",         m["cpu_pct"],          t("cpu_warning",75),        t("cpu_critical",90),         "CPU %",            False),
+        ("mem_pct",         m["mem_pct"],          t("mem_warning",80),        t("mem_critical",95),         "Memoria %",        False),
     ]
-    for key, value, warn, crit, label, unit, invert in checks:
+    for key, val, warn, crit, label, invert in checks:
         if invert:
-            sev = "CRITICAL" if value < crit else "WARNING" if value < warn else None
+            sev = "CRITICAL" if val < crit else "WARNING" if val < warn else None
         else:
-            sev = "CRITICAL" if value >= crit else "WARNING" if value >= warn else None
+            sev = "CRITICAL" if val >= crit else "WARNING" if val >= warn else None
         if sev:
-            alerts.append({"severity": sev, "metric": label,
-                           "value": f"{value}{unit}",
-                           "threshold": f"WARN={warn}{unit}  CRIT={crit}{unit}"})
+            alerts.append({"severity":sev,"metric":label,"value":str(val),
+                           "threshold":f"W={warn} C={crit}","ds_id":m["datasource_id"]})
     return alerts
 
+def save_alerts(alerts: list, ds_id: int):
+    if not alerts: return
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor()
+        for a in alerts:
+            cur.execute("""
+                INSERT INTO alert_log (datasource_id,severity,metric_name,metric_value,threshold,message)
+                VALUES (%s,%s,%s,%s,%s,%s)
+            """, (ds_id, a["severity"], a["metric"], a["value"], a["threshold"],
+                  f"{a['metric']}={a['value']} | umbral:{a['threshold']}"))
+        conn.commit(); cur.close()
+    finally:
+        release_conn(conn)
 
-# ─────────────────────────────────────────────────────────────
-# HILO DE FONDO
-# ─────────────────────────────────────────────────────────────
+# ── Hilo de fondo ─────────────────────────────────────────────────────────────
+
 def background_collector():
-    cfg        = load_config()
-    refresh    = cfg.getint("monitor", "refresh_interval", fallback=5)
-    save_every = max(1, 60 // refresh)
-    tick       = 0
-    cpu_warmed = False
-
-    # Inicializar BD en segundo plano para no bloquear el arranque de la app
-    log.info("Iniciando conexión a base de datos en segundo plano...")
-    init_db(retries=20, delay=15.0)
+    log.info("Iniciando background_collector...")
+    init_db()
+    cfg = load_config()
+    tick = 0
+    if _PSUTIL:
+        try: psutil.cpu_percent(interval=None)
+        except: pass
 
     while True:
         try:
-            if not cpu_warmed and _PSUTIL_OK and _proc is not None:
-                _proc.cpu_percent(interval=None)
-                psutil.cpu_percent(interval=None)
-                cpu_warmed = True
+            conn = get_monitor_conn()
+            cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cur.execute("SELECT * FROM datasources WHERE activa=TRUE")
+            sources = [dict(r) for r in cur.fetchall()]
+            cur.close(); release_conn(conn)
 
-            metrics = collect_real_metrics()
-            alerts  = evaluate_alerts(metrics, cfg)
-
-            with _cache_lock:
-                _cache["metrics"]     = metrics
-                _cache["alerts"]      = alerts
-                _cache["error"]       = None
-                _cache["last_update"] = datetime.now().isoformat()
-
-            tick += 1
-            if tick % save_every == 0:
-                save_snapshot(metrics)
-                if alerts:
-                    save_alerts(alerts)
-
+            for ds in sources:
+                ds_id = ds["id"]
+                try:
+                    tipo = (ds.get("tipo_db") or "postgresql").lower()
+                    if tipo == "postgresql":
+                        m = collect_pg_metrics(ds)
+                    else:
+                        raise NotImplementedError(f"Tipo '{tipo}' no soportado aún.")
+                    with _cache_lock:
+                        _cache[ds_id] = {"metrics": m, "error": None,
+                                         "ts": datetime.now().isoformat()}
+                    tick += 1
+                    if tick % 2 == 0:
+                        save_snapshot(m)
+                        alts = evaluate_alerts(m, cfg)
+                        if alts: save_alerts(alts, ds_id)
+                except Exception as e:
+                    log.error("DS %s error: %s", ds_id, e)
+                    with _cache_lock:
+                        prev = _cache.get(ds_id, {})
+                        _cache[ds_id] = {"metrics": prev.get("metrics"),
+                                         "error": str(e),
+                                         "ts": datetime.now().isoformat()}
         except Exception as e:
-            log.error("Error en background_collector: %s", e)
-            with _cache_lock:
-                _cache["error"] = f"Error al recopilar métricas: {e}"
+            log.error("background_collector: %s", e)
 
-        time.sleep(refresh)
+        interval = cfg_int("monitor", "refresh_interval", 30)
+        time.sleep(interval)
 
+# ── SQL Import helpers ────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# MIDDLEWARE
-# ─────────────────────────────────────────────────────────────
-@app.before_request
-def before_request():
-    with _stats_lock:
-        _stats["requests_total"]  += 1
-        _stats["requests_active"] += 1
+DANGEROUS_RE = re.compile(
+    r"\b(DROP\s+DATABASE|DROP\s+SCHEMA\s+public|TRUNCATE)\b",
+    re.IGNORECASE
+)
 
-@app.teardown_request
-def teardown_request(exc=None):
-    with _stats_lock:
-        _stats["requests_active"] = max(0, _stats["requests_active"] - 1)
+def split_sql(text: str) -> list:
+    text = re.sub(r"--[^\n]*", "", text)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    return [s.strip() for s in text.split(";") if s.strip()]
 
+def get_ds_by_id(ds_id: int) -> dict | None:
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM datasources WHERE id=%s", (ds_id,))
+        row = cur.fetchone()
+        cur.close()
+        return dict(row) if row else None
+    finally:
+        release_conn(conn)
 
-# ─────────────────────────────────────────────────────────────
-# RUTAS
-# ─────────────────────────────────────────────────────────────
+# ── Rutas ─────────────────────────────────────────────────────────────────────
+
 @app.route("/")
-def index():
-    return render_template("index.html")
-
+def index(): return render_template("index.html")
 
 @app.route("/api/health")
 def api_health():
-    """Health check para Azure."""
-    if not _PSYCOPG2_OK:
-        return {"status": "error", "error": f"ImportError: {_PSYCOPG2_ERR}"}, 500
+    started = _initialized.is_set()
+    return {"status": "ok" if started else "starting"}, 200
 
-    with _cache_lock:
-        ok  = _cache["metrics"] is not None
-        err = _cache["error"]
-    return {"status": "ok" if ok else "starting", "error": err}, 200
+# ── Datasources CRUD ──────────────────────────────────────────────────────────
 
+@app.route("/api/datasources", methods=["GET"])
+def api_ds_list():
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id,nombre,tipo_db,host,puerto,usuario,database,activa,created_at FROM datasources ORDER BY id")
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        for r in rows:
+            if hasattr(r.get("created_at"), "isoformat"):
+                r["created_at"] = r["created_at"].isoformat()
+            ds_id = r["id"]
+            with _cache_lock:
+                cached = _cache.get(ds_id, {})
+            r["status"]     = cached.get("metrics", {}).get("status", "unknown") if cached.get("metrics") else "unknown"
+            r["last_error"] = cached.get("error")
+            r["last_ts"]    = cached.get("ts")
+        return jsonify(rows)
+    finally:
+        release_conn(conn)
+
+@app.route("/api/datasources", methods=["POST"])
+def api_ds_create():
+    d = request.json or {}
+    required = ["nombre","tipo_db","host","puerto","usuario","database"]
+    missing = [f for f in required if not d.get(f)]
+    if missing:
+        return {"error": f"Faltan campos: {', '.join(missing)}"}, 400
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO datasources (nombre,tipo_db,host,puerto,usuario,password,database,activa)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+        """, (d["nombre"], d["tipo_db"], d["host"], int(d["puerto"]),
+              d["usuario"], d.get("password",""), d["database"],
+              d.get("activa", True)))
+        new_id = cur.fetchone()[0]
+        conn.commit(); cur.close()
+        return {"id": new_id, "message": "Datasource creado."}, 201
+    finally:
+        release_conn(conn)
+
+@app.route("/api/datasources/<int:ds_id>", methods=["PUT"])
+def api_ds_update(ds_id):
+    d = request.json or {}
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor()
+        fields, vals = [], []
+        for col in ["nombre","tipo_db","host","puerto","usuario","password","database","activa"]:
+            if col in d:
+                fields.append(f"{col}=%s")
+                vals.append(int(d[col]) if col == "puerto" else d[col])
+        if not fields:
+            return {"error": "Sin campos para actualizar."}, 400
+        vals.append(ds_id)
+        cur.execute(f"UPDATE datasources SET {', '.join(fields)} WHERE id=%s", vals)
+        if cur.rowcount == 0:
+            return {"error": "No encontrado."}, 404
+        conn.commit(); cur.close()
+        return {"message": "Actualizado."}
+    finally:
+        release_conn(conn)
+
+@app.route("/api/datasources/<int:ds_id>", methods=["DELETE"])
+def api_ds_delete(ds_id):
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM datasources WHERE id=%s", (ds_id,))
+        if cur.rowcount == 0:
+            return {"error": "No encontrado."}, 404
+        conn.commit(); cur.close()
+        with _cache_lock:
+            _cache.pop(ds_id, None)
+        return {"message": "Eliminado."}
+    finally:
+        release_conn(conn)
+
+@app.route("/api/datasources/<int:ds_id>/test", methods=["POST"])
+def api_ds_test(ds_id):
+    ds = get_ds_by_id(ds_id)
+    if not ds:
+        return {"error": "No encontrado."}, 404
+    ok, ms, err = test_datasource(ds)
+    return {"ok": ok, "latency_ms": ms, "error": err}
+
+# ── Métricas y resumen ────────────────────────────────────────────────────────
 
 @app.route("/api/metrics")
 def api_metrics():
+    ds_id = request.args.get("datasource_id", type=int)
     with _cache_lock:
-        if _cache["error"] and _cache["metrics"] is None:
-            return {"error": _cache["error"]}, 503
-        if _cache["metrics"] is None:
+        snap = dict(_cache)
+    if ds_id:
+        entry = snap.get(ds_id)
+        if not entry:
             return {"status": "loading"}, 202
-        return {
-            "metrics":     _cache["metrics"],
-            "alerts":      _cache["alerts"],
-            "last_update": _cache["last_update"],
-        }
+        return jsonify(entry)
+    # todos
+    return jsonify(snap)
 
+@app.route("/api/summary/global")
+def api_summary_global():
+    with _cache_lock:
+        snap = dict(_cache)
+    total  = len(snap)
+    online = sum(1 for v in snap.values() if not v.get("error") and v.get("metrics"))
+    statuses = [v["metrics"]["status"] for v in snap.values() if v.get("metrics")]
+    global_st = "CRITICAL" if "CRITICAL" in statuses else "WARNING" if "WARNING" in statuses else "OK"
+    return jsonify({
+        "total_datasources": total,
+        "online": online,
+        "offline": total - online,
+        "global_status": global_st,
+        "datasources": {
+            ds_id: {"status": v.get("metrics",{}).get("status","unknown"),
+                    "error":  v.get("error"), "ts": v.get("ts")}
+            for ds_id, v in snap.items()
+        }
+    })
+
+@app.route("/api/summary/<int:ds_id>")
+def api_summary_ds(ds_id):
+    with _cache_lock:
+        entry = _cache.get(ds_id)
+    if not entry:
+        return {"status": "loading"}, 202
+    return jsonify(entry)
 
 @app.route("/api/history")
 def api_history():
+    ds_id = request.args.get("datasource_id", type=int)
+    conn = get_monitor_conn()
     try:
-        conn = get_db()
-        cur  = execute_tracked(conn, """
-            SELECT captured_at, threads_connected, threads_running,
-                   connection_pct, qps, innodb_hit_ratio, slow_queries,
-                   status, cpu_pct, mem_mb
-            FROM health_snapshots
-            ORDER BY id DESC LIMIT 100
-        """)
-        cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in reversed(cur.fetchall())]
-        conn.close()
-        # Serializar timestamps
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if ds_id:
+            cur.execute("""
+                SELECT * FROM health_snapshots WHERE datasource_id=%s
+                ORDER BY id DESC LIMIT 100
+            """, (ds_id,))
+        else:
+            cur.execute("SELECT * FROM health_snapshots ORDER BY id DESC LIMIT 200")
+        rows = [dict(r) for r in reversed(cur.fetchall())]
+        cur.close()
         for r in rows:
             if hasattr(r.get("captured_at"), "isoformat"):
                 r["captured_at"] = r["captured_at"].isoformat()
-        return rows
-    except Exception as e:
-        return {"error": str(e)}, 500
-
+        return jsonify(rows)
+    finally:
+        release_conn(conn)
 
 @app.route("/api/alerts/history")
 def api_alerts_history():
+    ds_id = request.args.get("datasource_id", type=int)
+    conn = get_monitor_conn()
     try:
-        conn = get_db()
-        cur  = execute_tracked(conn, """
-            SELECT alerted_at, severity, metric_name, metric_value, threshold, message
-            FROM alert_log
-            ORDER BY id DESC LIMIT 50
-        """)
-        cols = [d[0] for d in cur.description]
-        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
-        conn.close()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if ds_id:
+            cur.execute("""
+                SELECT * FROM alert_log WHERE datasource_id=%s
+                ORDER BY id DESC LIMIT 50
+            """, (ds_id,))
+        else:
+            cur.execute("SELECT * FROM alert_log ORDER BY id DESC LIMIT 100")
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
         for r in rows:
             if hasattr(r.get("alerted_at"), "isoformat"):
                 r["alerted_at"] = r["alerted_at"].isoformat()
-        return rows
-    except Exception as e:
-        return {"error": str(e)}, 500
+        return jsonify(rows)
+    finally:
+        release_conn(conn)
 
+# ── Importación SQL ───────────────────────────────────────────────────────────
+
+@app.route("/api/import-sql", methods=["POST"])
+def api_import_sql():
+    ds_id = request.form.get("datasource_id", type=int)
+    if not ds_id:
+        return {"error": "datasource_id requerido"}, 400
+
+    f = request.files.get("file")
+    if not f:
+        return {"error": "Archivo requerido"}, 400
+    if not f.filename.lower().endswith(".sql"):
+        return {"error": "Solo se aceptan archivos .sql"}, 400
+
+    max_mb  = cfg_int("monitor", "max_sql_upload_mb", 10)
+    content = f.read()
+    if len(content) > max_mb * 1024 * 1024:
+        return {"error": f"Archivo supera el límite de {max_mb} MB"}, 413
+
+    try:
+        sql_text = content.decode("utf-8")
+    except Exception:
+        sql_text = content.decode("latin-1", errors="replace")
+
+    if cfg_bool("monitor", "block_dangerous_sql", True):
+        m = DANGEROUS_RE.search(sql_text)
+        if m:
+            _record_import(ds_id, f.filename, "blocked", 0, 0, f"Instrucción bloqueada: {m.group()}")
+            return {"error": f"Instrucción peligrosa detectada: {m.group()}"}, 400
+
+    ds = get_ds_by_id(ds_id)
+    if not ds:
+        return {"error": "Datasource no encontrado"}, 404
+
+    statements = split_sql(sql_text)
+    if not statements:
+        return {"error": "El archivo no contiene sentencias SQL válidas"}, 400
+
+    ok_count = fail_count = 0
+    errors = []
+    try:
+        conn = connect_to_datasource(ds, timeout=30)
+        conn.autocommit = False
+        cur = conn.cursor()
+        try:
+            for stmt in statements:
+                try:
+                    cur.execute(stmt)
+                    ok_count += 1
+                except Exception as e:
+                    fail_count += 1
+                    errors.append(str(e)[:200])
+                    conn.rollback()
+                    break
+            else:
+                conn.commit()
+        finally:
+            cur.close(); conn.close()
+    except Exception as e:
+        return {"error": f"Error de conexión: {e}"}, 502
+
+    status = "success" if fail_count == 0 else "failed"
+    _record_import(ds_id, f.filename, status, ok_count, fail_count,
+                   errors[0] if errors else None)
+    return jsonify({
+        "status": status,
+        "statements_ok":     ok_count,
+        "statements_failed": fail_count,
+        "total_statements":  len(statements),
+        "errors":            errors[:5],
+    })
+
+def _record_import(ds_id, filename, status, ok, fail, err_msg):
+    try:
+        conn = get_monitor_conn()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO sql_imports
+              (datasource_id,filename,status,statements_ok,statements_failed,error_message)
+            VALUES (%s,%s,%s,%s,%s,%s)
+        """, (ds_id, filename, status, ok, fail, err_msg))
+        conn.commit(); cur.close()
+        release_conn(conn)
+    except Exception as e:
+        log.error("No se pudo guardar historial de importación: %s", e)
+
+@app.route("/api/import-history")
+def api_import_history():
+    ds_id = request.args.get("datasource_id", type=int)
+    conn  = get_monitor_conn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        if ds_id:
+            cur.execute("""
+                SELECT i.*, d.nombre as ds_nombre FROM sql_imports i
+                LEFT JOIN datasources d ON d.id=i.datasource_id
+                WHERE i.datasource_id=%s ORDER BY i.id DESC LIMIT 50
+            """, (ds_id,))
+        else:
+            cur.execute("""
+                SELECT i.*, d.nombre as ds_nombre FROM sql_imports i
+                LEFT JOIN datasources d ON d.id=i.datasource_id
+                ORDER BY i.id DESC LIMIT 100
+            """)
+        rows = [dict(r) for r in cur.fetchall()]
+        cur.close()
+        for r in rows:
+            if hasattr(r.get("uploaded_at"), "isoformat"):
+                r["uploaded_at"] = r["uploaded_at"].isoformat()
+        return jsonify(rows)
+    finally:
+        release_conn(conn)
+
+# ── Config endpoint ───────────────────────────────────────────────────────────
 
 @app.route("/api/config")
 def api_config():
     cfg = load_config()
-    return {
-        "refresh_interval": cfg.getint("monitor", "refresh_interval", fallback=5),
-        "storage":          "PostgreSQL",
-        "db_host":          os.environ.get("PGHOST", "Azure"),
-        "thresholds": {
-            "connections_warning":      cfg.getfloat("thresholds", "connections_warning",      fallback=70),
-            "connections_critical":     cfg.getfloat("thresholds", "connections_critical",     fallback=90),
-            "cache_hit_warning":        cfg.getfloat("thresholds", "cache_hit_warning",        fallback=85),
-            "cache_hit_critical":       cfg.getfloat("thresholds", "cache_hit_critical",       fallback=70),
-            "threads_running_warning":  cfg.getfloat("thresholds", "threads_running_warning",  fallback=20),
-            "threads_running_critical": cfg.getfloat("thresholds", "threads_running_critical", fallback=50),
-            "slow_queries_warning":     cfg.getfloat("thresholds", "slow_queries_warning",     fallback=10),
-            "slow_queries_critical":    cfg.getfloat("thresholds", "slow_queries_critical",    fallback=50),
-            "cpu_warning":              cfg.getfloat("thresholds", "cpu_warning",              fallback=70),
-            "cpu_critical":             cfg.getfloat("thresholds", "cpu_critical",             fallback=90),
-            "mem_warning":              cfg.getfloat("thresholds", "mem_warning",              fallback=80),
-            "mem_critical":             cfg.getfloat("thresholds", "mem_critical",             fallback=95),
-        }
-    }
+    return jsonify({
+        "refresh_interval": cfg_int("monitor","refresh_interval",30),
+        "max_sql_upload_mb": cfg_int("monitor","max_sql_upload_mb",10),
+        "block_dangerous_sql": cfg_bool("monitor","block_dangerous_sql",True),
+    })
 
+# ── Arranque ──────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────────────────────────
-# RUTAS DE SERVICIOS - GESTIÓN Y CONECTIVIDAD
-# ─────────────────────────────────────────────────────────────
-@app.route("/api/services")
-def api_services():
-    """Obtiene lista de todos los servicios disponibles."""
-    services = service_manager.get_all_services()
-    return {
-        "services": [s.to_dict() for s in services],
-        "total": len(services),
-        "active": len(service_manager.get_active_services())
-    }
-
-
-@app.route("/api/services/active")
-def api_services_active():
-    """Obtiene lista de servicios activos."""
-    services = service_manager.get_active_services()
-    return {
-        "services": [s.to_dict() for s in services],
-        "count": len(services)
-    }
-
-
-@app.route("/api/services/<service_id>")
-def api_service_detail(service_id: str):
-    """Obtiene detalles de un servicio específico."""
-    service = service_manager.get_service(service_id)
-    if not service:
-        return {"error": f"Servicio '{service_id}' no encontrado"}, 404
-    return service.to_dict()
-
-
-@app.route("/api/services/type/<service_type>")
-def api_services_by_type(service_type: str):
-    """Obtiene servicios de un tipo específico."""
-    valid_types = ["mysql", "postgresql", "sqlserver", "elasticsearch"]
-    if service_type not in valid_types:
-        return {"error": f"Tipo inválido. Válidos: {', '.join(valid_types)}"}, 400
-    
-    services = service_manager.get_services_by_type(service_type)
-    return {
-        "type": service_type,
-        "services": [s.to_dict() for s in services],
-        "count": len(services)
-    }
-
-
-@app.route("/api/services/region/<region>")
-def api_services_by_region(region: str):
-    """Obtiene servicios de una región específica."""
-    valid_regions = ["local", "azure", "elastika", "aws"]
-    if region not in valid_regions:
-        return {"error": f"Región inválida. Válidas: {', '.join(valid_regions)}"}, 400
-    
-    services = service_manager.get_services_by_region(region)
-    return {
-        "region": region,
-        "services": [s.to_dict() for s in services],
-        "count": len(services)
-    }
-
-
-@app.route("/api/services/<service_id>/enable", methods=["POST"])
-def api_enable_service(service_id: str):
-    """Activa un servicio."""
-    if service_manager.enable_service(service_id):
-        service = service_manager.get_service(service_id)
-        return {"status": "activated", "service": service.to_dict()}
-    return {"error": f"Servicio '{service_id}' no encontrado"}, 404
-
-
-@app.route("/api/services/<service_id>/disable", methods=["POST"])
-def api_disable_service(service_id: str):
-    """Desactiva un servicio."""
-    if service_manager.disable_service(service_id):
-        service = service_manager.get_service(service_id)
-        return {"status": "deactivated", "service": service.to_dict()}
-    return {"error": f"Servicio '{service_id}' no encontrado"}, 404
-
-
-@app.route("/api/connectivity/status")
-def api_connectivity_status():
-    """Verifica el estado de conexión de todos los servicios."""
-    results = connectivity_checker.check_all_connections()
-    status_map = {}
-    for service_id, connected in results.items():
-        service = service_manager.get_service(service_id)
-        status_map[service_id] = {
-            "name": service.name,
-            "connected": connected,
-            "status": service.status,
-            "last_check": service.last_check
-        }
-    return status_map
-
-
-@app.route("/api/connectivity/matrix")
-def api_connectivity_matrix():
-    """Obtiene la matriz de conectividad entre servicios."""
-    matrix = connectivity_checker.check_inter_service_connectivity()
-    formatted_matrix = {}
-    for from_id, connections in matrix.items():
-        from_service = service_manager.get_service(from_id)
-        formatted_matrix[from_service.name] = {}
-        for to_id, connected in connections.items():
-            to_service = service_manager.get_service(to_id)
-            formatted_matrix[from_service.name][to_service.name] = connected
-    return formatted_matrix
-
-
-@app.route("/api/summary")
-def api_summary():
-    """Obtiene un resumen del estado del sistema completo."""
-    manager_info = service_manager.to_dict()
-    connectivity_status = connectivity_checker.check_all_connections()
-    
-    connected_count = sum(1 for v in connectivity_status.values() if v)
-    
-    return {
-        "timestamp": datetime.now().isoformat(),
-        "services": {
-            "total": manager_info["summary"]["total_services"],
-            "active": manager_info["summary"]["active_services"],
-            "connected": connected_count,
-            "by_type": manager_info["summary"]["by_type"],
-            "by_region": manager_info["summary"]["by_region"]
-        },
-        "connectivity": {
-            "status": connectivity_status,
-            "matrix": connectivity_checker.check_inter_service_connectivity(),
-            "healthy": connected_count == manager_info["summary"]["active_services"]
-        }
-    }
-
-
-# ─────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────
 def startup():
-    global DATABASE_URL
-    DATABASE_URL = resolve_database_url()
-
-    log.info("=== DB Health Monitor (PostgreSQL) arrancando ===")
-    log.info("DATABASE_URL host: %s",
-             DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else "(no configurada)")
+    log.info("=== DB Health Monitor arrancando ===")
+    if _PSUTIL:
+        try: psutil.cpu_percent(interval=None)
+        except: pass
     t = threading.Thread(target=background_collector, daemon=True)
     t.start()
-    log.info("Hilo de recolección iniciado.")
-
 
 if __name__ == "__main__":
     startup()
-    print(f"\n  [OK] DB Health Monitor (PostgreSQL) iniciado")
-    print(f"  >>  Abre tu navegador en: http://localhost:5000\n")
     app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
 else:
     startup()

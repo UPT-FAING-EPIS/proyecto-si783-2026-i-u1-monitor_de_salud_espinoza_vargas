@@ -1,13 +1,4 @@
-# ══════════════════════════════════════════════════════════════
-#  DB Health Monitor — Deploy to Azure App Service
-#  Base de datos: Azure Database for PostgreSQL Flexible Server
-#  Secretos necesarios en GitHub:
-#    AZURE_CREDENTIALS      -> JSON del Service Principal
-#    AZURE_SUBSCRIPTION_ID -> ID de tu suscripcion Azure
-#  (La contraseña de PostgreSQL se genera automaticamente)
-# ══════════════════════════════════════════════════════════════
-
-name: Deploy DB Health Monitor to Azure
+name: Deploy DB Health Monitor
 
 on:
   push:
@@ -16,24 +7,17 @@ on:
 
 env:
   RESOURCE_GROUP: rg-db-health-monitor
-  PG_ADMIN_USER:  dbadmin
-  PG_DB_NAME:     dbmonitor
 
-# ══════════════════════════════════════════════════════════════
 jobs:
-
   deploy:
-    name: "Desplegar Monitor en Azure App Service"
+    name: Deploy to Azure App Service
     runs-on: ubuntu-latest
 
     steps:
-
-      # ── Checkout ─────────────────────────────────────────────
-      - name: Checkout codigo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # ── Login Azure ──────────────────────────────────────────
-      - name: Login en Azure
+      - name: Login Azure
         uses: azure/login@v2
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
@@ -41,165 +25,99 @@ jobs:
       - name: Establecer suscripcion
         run: az account set --subscription "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
 
-      # ── Nombres deterministas + contraseña auto-generada ────────
-      - name: Generar nombres de recursos
+      # ── Nombres deterministas ────────────────────────────────────────────────
+      - name: Generar nombres
         id: names
         run: |
           SUFFIX=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" | sha256sum | cut -c1-10)
-          echo "webapp=db-monitor-${SUFFIX}"     >> $GITHUB_OUTPUT
-          echo "plan=asp-db-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
-          echo "pgserver=pg-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
-          echo "suffix=${SUFFIX}"                >> $GITHUB_OUTPUT
+          echo "webapp=db-monitor-${SUFFIX}"   >> $GITHUB_OUTPUT
+          echo "plan=asp-db-monitor-${SUFFIX}" >> $GITHUB_OUTPUT
 
-          # Contraseña determinista: siempre igual para la misma suscripcion,
-          # cumple requisitos Azure (mayus + minus + numero + especial, 20+ chars)
-          HASH=$(echo -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}pg-salt-2026" | sha256sum | cut -c1-14)
-          PG_PASS="Db${HASH}Az1!"
-          echo "pg_pass=${PG_PASS}" >> $GITHUB_OUTPUT
-
-      # ── App Service Plan (auto-region) ───────────────────────
-      - name: Crear Resource Group y App Service Plan
-        id: infra
+      # ── App Service Plan ─────────────────────────────────────────────────────
+      - name: Crear/verificar App Service Plan
         run: |
           PLAN="${{ steps.names.outputs.plan }}"
+          RG="${{ env.RESOURCE_GROUP }}"
 
-          EXISTS=$(az appservice plan show \
-            --name "$PLAN" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "name" -o tsv 2>/dev/null || true)
-
+          EXISTS=$(az appservice plan show --name "$PLAN" --resource-group "$RG" --query "name" -o tsv 2>/dev/null || true)
           if [ -n "$EXISTS" ]; then
-            echo "App Service Plan ya existe."
-            LOC=$(az appservice plan show \
-              --name "$PLAN" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --query "location" -o tsv 2>/dev/null || echo "centralus")
-            echo "resolved_location=${LOC}" >> $GITHUB_OUTPUT
+            echo "Plan ya existe: $PLAN"
             exit 0
           fi
 
-          REGIONS=(
-            "centralus" "swedencentral" "northeurope" "westeurope"
-            "uksouth" "francecentral" "germanywestcentral"
-            "australiaeast" "southeastasia" "centralindia"
-            "japaneast" "canadacentral" "eastus" "eastus2"
-          )
-
-          CREATED=false
-          for REGION in "${REGIONS[@]}"; do
-            echo ">>> Intentando region: ${REGION}"
-            az group create \
-              --name     "${{ env.RESOURCE_GROUP }}" \
-              --location "${REGION}" \
-              --output none 2>/dev/null || true
-
-            if timeout 120 az appservice plan create \
-              --name           "$PLAN" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --location       "${REGION}" \
-              --sku            B1 \
-              --is-linux \
-              --output none 2>&1; then
-              echo "Plan creado en: ${REGION}"
-              echo "resolved_location=${REGION}" >> $GITHUB_OUTPUT
-              CREATED=true
+          # Intentar regiones hasta encontrar una disponible
+          for REGION in centralus eastus westus northeurope westeurope uksouth; do
+            echo ">>> Probando región: $REGION"
+            az group create --name "$RG" --location "$REGION" --output none 2>/dev/null || true
+            if az appservice plan create \
+              --name "$PLAN" --resource-group "$RG" \
+              --location "$REGION" --sku B1 --is-linux --output none 2>&1; then
+              echo "Plan creado en $REGION"
               break
-            else
-              az appservice plan delete \
-                --name "$PLAN" \
-                --resource-group "${{ env.RESOURCE_GROUP }}" \
-                --yes 2>/dev/null || true
             fi
           done
 
-          if [ "$CREATED" = false ]; then
-            echo "ERROR: No se pudo crear el App Service Plan."
-            exit 1
+      # ── Web App ──────────────────────────────────────────────────────────────
+      - name: Crear/actualizar Web App
+        run: |
+          APP="${{ steps.names.outputs.webapp }}"
+          RG="${{ env.RESOURCE_GROUP }}"
+          PLAN="${{ steps.names.outputs.plan }}"
+
+          EXISTS=$(az webapp show --name "$APP" --resource-group "$RG" --query "name" -o tsv 2>/dev/null || true)
+          if [ -z "$EXISTS" ]; then
+            az webapp create \
+              --name "$APP" --resource-group "$RG" \
+              --plan "$PLAN" --runtime "PYTHON|3.11" --output none
           fi
 
-      # NOTE: PostgreSQL server creation is skipped because the database
-      # will be hosted externally (on the Elastika VM). The workflow
-      # deploys only the web application.
-
-      # ── Web App ──────────────────────────────────────────────
-      - name: Recreate Web App (delete if exists)
+      # ── App Settings ─────────────────────────────────────────────────────────
+      - name: Configurar App Settings
         run: |
           APP="${{ steps.names.outputs.webapp }}"
           RG="${{ env.RESOURCE_GROUP }}"
 
-          EXISTS=$(az webapp show --name "$APP" --resource-group "$RG" --query "name" -o tsv 2>/dev/null || true)
-
-          if [ -n "$EXISTS" ]; then
-            echo "Web App $APP already exists. Deleting..."
-            az webapp delete --name "$APP" --resource-group "$RG" --yes || true
-            echo "Deleted $APP. Waiting a few seconds before recreate..."
-            sleep 8
-          fi
-
-          echo "Creating Web App ${APP}..."
-          az webapp create \
-            --name           "$APP" \
-            --resource-group "$RG" \
-            --plan           "${{ steps.names.outputs.plan }}" \
-            --runtime        "PYTHON|3.11" \
-            --output none
-
-          echo "Web App created: ${APP}"
-
-      # ── App Settings ─────────────────────────────────────────
-      - name: Configurar App Settings (usar ELASTIKA_DATABASE_URL)
-        run: |
-          # El workflow espera que exista el secret ELASTIKA_DATABASE_URL
-          if [ -z "${{ secrets.ELASTIKA_DATABASE_URL }}" ]; then
-            echo "ERROR: El secret ELASTIKA_DATABASE_URL no existe. Crea el secret en GitHub antes de ejecutar el workflow." >&2
-            exit 1
-          fi
-
           az webapp config appsettings set \
-            --name           "${{ steps.names.outputs.webapp }}" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
+            --name "$APP" --resource-group "$RG" \
             --settings \
-              DATABASE_URL="${{ secrets.ELASTIKA_DATABASE_URL }}" \
-              WEBSITES_PORT="5000" \
               SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
+              WEBSITES_PORT="5000" \
+              PYTHONDONTWRITEBYTECODE="1" \
             --output none
 
-      # ── Startup command ──────────────────────────────────────
+      # ── Startup command ───────────────────────────────────────────────────────
       - name: Configurar startup command
         run: |
           az webapp config set \
-            --name           "${{ steps.names.outputs.webapp }}" \
+            --name "${{ steps.names.outputs.webapp }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --startup-file   "gunicorn --bind=0.0.0.0:5000 --workers=1 --threads=2 --timeout=120 server:app" \
+            --startup-file "gunicorn --bind=0.0.0.0:5000 --workers=1 --threads=4 --timeout=120 --keep-alive=5 server:app" \
             --output none
 
-      # ── Deploy ───────────────────────────────────────────────
+      # ── Deploy ────────────────────────────────────────────────────────────────
       - name: Desplegar aplicacion
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ steps.names.outputs.webapp }}
           package: .
 
-      # ── Health check post-deploy ─────────────────────────────
-      - name: Verificar despliegue (health check)
+      # ── Health check ──────────────────────────────────────────────────────────
+      - name: Health check post-deploy
         run: |
           APP_URL="https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
-          echo "Esperando que la app arranque..."
-          for i in $(seq 1 18); do
-            HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "${APP_URL}/api/health" || echo "000")
-            echo "  Intento ${i}/18 — HTTP ${HTTP_CODE}"
-            if [ "$HTTP_CODE" = "200" ]; then
-              echo "✔ App respondiendo correctamente"
-              break
+          echo "Esperando app en: $APP_URL"
+          for i in $(seq 1 20); do
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" "${APP_URL}/api/health" || echo "000")
+            echo "  Intento ${i}/20 — HTTP ${CODE}"
+            if [ "$CODE" = "200" ]; then
+              echo "✅ App respondiendo"
+              echo ""
+              echo "🌐 Dashboard: ${APP_URL}"
+              exit 0
             fi
-            sleep 10
+            sleep 15
           done
+          echo "⚠ Health check no pasó, revisar logs de Azure"
 
-      # ── URL final ────────────────────────────────────────────
-      - name: Mostrar URL del dashboard
-        run: |
-          echo ""
-          echo "=========================================="
-          echo "  Dashboard disponible en:"
-          echo "  https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
-          echo "=========================================="
+      - name: Mostrar URL
+        run: echo "Dashboard: https://${{ steps.names.outputs.webapp }}.azurewebsites.net"

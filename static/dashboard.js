@@ -1,514 +1,484 @@
-/* ═══════════════════════════════════════════════════════
-   MySQL Health Monitor — Dashboard JS
-═══════════════════════════════════════════════════════ */
+/* dashboard.js — DB Health Monitor */
 
-// ─────────────────────────────────────────────────────
-// CONFIG & STATE
-// ─────────────────────────────────────────────────────
-let REFRESH = 5;         // segundos (se actualiza desde /api/config)
-let THRESHOLDS = {};
-let countdown = REFRESH;
-let historyLen = 30;     // puntos en los gráficos
+// ── State ──────────────────────────────────────────────────────────────────────
+let currentTab   = 'dashboard';
+let currentDsId  = 'global';
+let refreshTimer = null;
+let REFRESH_MS   = 30000;
+let datasources  = [];
 
-const history = {
-  labels: [],
-  qps:    [],
-  conn:   [],
-  cache:  [],
+// ── Charts ────────────────────────────────────────────────────────────────────
+const MAX_POINTS = 40;
+const chartDefaults = {
+  responsive: true, maintainAspectRatio: true,
+  animation: { duration: 300 },
+  plugins: { legend: { display: true, labels: { color: '#94a3b8', font: { size: 11 } } } },
+  scales: {
+    x: { ticks: { color: '#64748b', maxTicksLimit: 6, font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } },
+    y: { ticks: { color: '#64748b', font: { size: 10 } }, grid: { color: 'rgba(255,255,255,0.04)' } }
+  }
 };
 
-// ─────────────────────────────────────────────────────
-// CHART.JS — DEFAULTS
-// ─────────────────────────────────────────────────────
-Chart.defaults.color = '#64748b';
-Chart.defaults.borderColor = 'rgba(255,255,255,0.05)';
-Chart.defaults.font.family = "'Inter', sans-serif";
+function mkChart(id, label, color, yMax) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return null;
+  return new Chart(ctx, {
+    type: 'line',
+    data: { labels: [], datasets: [{ label, data: [], borderColor: color, backgroundColor: color + '20', fill: true, tension: 0.4, pointRadius: 2 }] },
+    options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, max: yMax } } }
+  });
+}
 
-function lineChartConfig(label, color, data, yMax) {
-  return {
+function mkDualChart(id, l1, c1, l2, c2) {
+  const ctx = document.getElementById(id);
+  if (!ctx) return null;
+  return new Chart(ctx, {
     type: 'line',
     data: {
-      labels: history.labels,
-      datasets: [{
-        label,
-        data,
-        borderColor: color,
-        backgroundColor: color.replace(')', ',0.1)').replace('rgb', 'rgba'),
-        borderWidth: 2,
-        pointRadius: 0,
-        tension: 0.4,
-        fill: true,
-      }]
+      labels: [],
+      datasets: [
+        { label: l1, data: [], borderColor: c1, backgroundColor: c1 + '20', fill: false, tension: 0.4, pointRadius: 2 },
+        { label: l2, data: [], borderColor: c2, backgroundColor: c2 + '20', fill: false, tension: 0.4, pointRadius: 2 }
+      ]
     },
-    options: {
-      animation: false,
-      responsive: true,
-      maintainAspectRatio: false,
-      interaction: { mode: 'index', intersect: false },
-      plugins: { legend: { display: false }, tooltip: { mode: 'index' } },
-      scales: {
-        x: { display: false },
-        y: {
-          min: 0,
-          max: yMax || undefined,
-          grid: { color: 'rgba(255,255,255,0.04)' },
-          ticks: { font: { size: 10 } },
+    options: { ...chartDefaults, scales: { ...chartDefaults.scales, y: { ...chartDefaults.scales.y, max: 100 } } }
+  });
+}
+
+const charts = {};
+
+function initCharts() {
+  charts.conn  = mkChart('chart-conn',  'Conexiones',     '#4a9eff', undefined);
+  charts.cache = mkChart('chart-cache', 'Cache Hit %',    '#a855f7', 100);
+  charts.sys   = mkDualChart('chart-sys', 'CPU %', '#f59e0b', 'RAM %', '#10b981');
+}
+
+function pushChart(chart, label, ...values) {
+  if (!chart) return;
+  chart.data.labels.push(label);
+  values.forEach((v, i) => chart.data.datasets[i].data.push(v));
+  if (chart.data.labels.length > MAX_POINTS) {
+    chart.data.labels.shift();
+    chart.data.datasets.forEach(d => d.data.shift());
+  }
+  chart.update('none');
+}
+
+// ── Tab navigation ─────────────────────────────────────────────────────────────
+function showTab(tab) {
+  currentTab = tab;
+  ['dashboard', 'datasources', 'import'].forEach(t => {
+    document.getElementById('section-' + t).classList.toggle('hidden', t !== tab);
+    document.getElementById('tab-' + t).classList.toggle('active', t === tab);
+  });
+  if (tab === 'datasources') loadDatasourcesTable();
+  if (tab === 'import')      { loadImportHistory(); loadDsSelects(); }
+}
+
+// ── Datasource selector (dashboard) ───────────────────────────────────────────
+function onDsChange() {
+  currentDsId = document.getElementById('ds-select').value;
+}
+
+function populateDsSelect(ds_list) {
+  datasources = ds_list;
+  const sel = document.getElementById('ds-select');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="global">🌐 Vista Global</option>';
+  ds_list.forEach(ds => {
+    const opt = document.createElement('option');
+    opt.value = ds.id;
+    opt.text  = `${ds.nombre} (${ds.tipo_db})`;
+    if (!ds.activa) opt.text += ' ⏸';
+    sel.appendChild(opt);
+  });
+  if (cur) sel.value = cur;
+  currentDsId = sel.value;
+}
+
+function loadDsSelects() {
+  const sel = document.getElementById('import-ds-select');
+  sel.innerHTML = '<option value="">— Selecciona fuente —</option>';
+  datasources.filter(d => d.activa).forEach(ds => {
+    const opt = document.createElement('option');
+    opt.value = ds.id;
+    opt.text  = `${ds.nombre} (${ds.host})`;
+    sel.appendChild(opt);
+  });
+}
+
+// ── KPI helpers ────────────────────────────────────────────────────────────────
+function pct(v) { return typeof v === 'number' ? v.toFixed(1) + '%' : '–'; }
+function num(v) { return typeof v === 'number' ? v : '–'; }
+
+function statusClass(s) {
+  if (!s) return 'pill-unk';
+  if (s === 'OK')       return 'pill-ok';
+  if (s === 'WARNING')  return 'pill-warn';
+  if (s === 'CRITICAL') return 'pill-crit';
+  return 'pill-unk';
+}
+
+function setBar(id, value, max = 100) {
+  const el = document.getElementById(id);
+  if (el) el.style.width = Math.min(100, (value / max) * 100).toFixed(1) + '%';
+}
+
+function setEl(id, text) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = text;
+}
+
+function setKpi(m) {
+  if (!m) return;
+  setEl('kpi-conn-val',    `${num(m.threads_connected)}/${num(m.max_connections)}`);
+  setEl('kpi-conn-pct',    pct(m.connection_pct) + ' uso');
+  setEl('kpi-cache-val',   pct(m.cache_hit_ratio));
+  setEl('kpi-cpu-val',     pct(m.cpu_pct));
+  setEl('kpi-mem-val',     pct(m.mem_pct));
+  setEl('kpi-size-val',    typeof m.db_size_mb === 'number' ? m.db_size_mb.toFixed(1) + ' MB' : '–');
+  setEl('kpi-status-val',  m.status || '–');
+  setEl('kpi-threads-sub', `${num(m.threads_running)} activos / ${num(m.threads_waiting)} esperando`);
+
+  setBar('kpi-conn-bar',  m.connection_pct);
+  setBar('kpi-cache-bar', m.cache_hit_ratio);
+  setBar('kpi-cpu-bar',   m.cpu_pct);
+  setBar('kpi-mem-bar',   m.mem_pct);
+
+  const statusEl = document.getElementById('kpi-status-val');
+  if (statusEl) {
+    statusEl.className = 'kpi-value ' + (m.status === 'OK' ? 'status-ok' : m.status === 'WARNING' ? 'status-warn' : 'status-crit');
+  }
+
+  const ts = new Date().toLocaleTimeString();
+  pushChart(charts.conn,  ts, m.threads_connected);
+  pushChart(charts.cache, ts, m.cache_hit_ratio);
+  pushChart(charts.sys,   ts, m.cpu_pct, m.mem_pct);
+
+  setEl('last-update', 'Actualizado: ' + new Date().toLocaleTimeString());
+}
+
+// ── Global summary table ───────────────────────────────────────────────────────
+function renderGlobalTable(snap) {
+  const tbody = document.getElementById('global-table-body');
+  if (!tbody) return;
+  const entries = Object.entries(snap);
+  if (!entries.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-row">Sin fuentes activas</td></tr>';
+    return;
+  }
+  tbody.innerHTML = entries.map(([id, v]) => {
+    const m  = v.metrics || {};
+    const ds = datasources.find(d => d.id == id) || {};
+    const st = m.status || 'unknown';
+    return `<tr>
+      <td>${ds.nombre || 'DS #'+id}</td>
+      <td>${ds.tipo_db || '–'}</td>
+      <td style="font-family:monospace">${ds.host || '–'}</td>
+      <td>${num(m.threads_connected)}/${num(m.max_connections)}</td>
+      <td>${pct(m.cache_hit_ratio)}</td>
+      <td><span class="pill ${statusClass(st)}">${st}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+// ── Main fetch loop ────────────────────────────────────────────────────────────
+async function fetchAndUpdate() {
+  try {
+    // Always load datasources list
+    const dsRes = await fetch('/api/datasources');
+    if (dsRes.ok) {
+      const ds_list = await dsRes.json();
+      populateDsSelect(ds_list);
+    }
+
+    if (currentDsId === 'global') {
+      // Global summary
+      const res = await fetch('/api/summary/global');
+      if (res.ok) {
+        const data = await res.json();
+        const st   = data.global_status || 'OK';
+        setGlobalStatus(st);
+        // Show first online source in KPIs
+        const metricsRes = await fetch('/api/metrics');
+        if (metricsRes.ok) {
+          const snap = await metricsRes.json();
+          const firstId = Object.keys(snap).find(k => snap[k].metrics);
+          if (firstId) setKpi(snap[firstId].metrics);
+          renderGlobalTable(snap);
         }
       }
+    } else {
+      const res = await fetch(`/api/summary/${currentDsId}`);
+      if (res.status === 202) { setEl('last-update', 'Cargando…'); return; }
+      if (res.ok) {
+        const data = await res.json();
+        if (data.metrics) setKpi(data.metrics);
+        if (data.error)   setEl('last-update', '⚠ ' + data.error);
+        const gs = data.metrics ? data.metrics.status : 'unknown';
+        setGlobalStatus(gs);
+      }
     }
+    document.getElementById('conn-dot').className = 'conn-dot dot-ok';
+  } catch (e) {
+    console.error('fetchAndUpdate:', e);
+    document.getElementById('conn-dot').className = 'conn-dot dot-err';
+  }
+}
+
+function setGlobalStatus(st) {
+  const el = document.getElementById('global-status');
+  if (!el) return;
+  el.textContent  = st;
+  el.className    = 'status-badge ' + (st === 'OK' ? 'badge-ok' : st === 'WARNING' ? 'badge-warn' : 'badge-crit');
+}
+
+function startLoop() {
+  fetchAndUpdate();
+  refreshTimer = setInterval(fetchAndUpdate, REFRESH_MS);
+}
+
+// ── Datasources CRUD ───────────────────────────────────────────────────────────
+async function loadDatasourcesTable() {
+  const tbody = document.getElementById('ds-table-body');
+  try {
+    const res  = await fetch('/api/datasources');
+    const list = await res.json();
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty-row">Sin fuentes configuradas</td></tr>';
+      return;
+    }
+    tbody.innerHTML = list.map(ds => {
+      const st = ds.status || 'unknown';
+      return `<tr>
+        <td>${ds.id}</td>
+        <td><strong>${ds.nombre}</strong></td>
+        <td>${ds.tipo_db}</td>
+        <td style="font-family:monospace">${ds.host}:${ds.puerto}</td>
+        <td>${ds.database}</td>
+        <td><span class="pill ${statusClass(st)}">${st}</span></td>
+        <td style="display:flex;gap:0.4rem;flex-wrap:wrap">
+          <button class="btn-sm success" onclick="testDs(${ds.id})">🔌 Test</button>
+          <button class="btn-sm" onclick="editDs(${ds.id})">✏️ Editar</button>
+          <button class="btn-sm danger" onclick="deleteDs(${ds.id}, '${ds.nombre}')">🗑</button>
+        </td>
+      </tr>`;
+    }).join('');
+  } catch (e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-row">Error: ${e.message}</td></tr>`;
+  }
+}
+
+async function testDs(id) {
+  const res  = await fetch(`/api/datasources/${id}/test`, { method: 'POST' });
+  const data = await res.json();
+  alert(data.ok ? `✅ Conectado en ${data.latency_ms} ms` : `❌ Error: ${data.error}`);
+  loadDatasourcesTable();
+}
+
+async function deleteDs(id, nombre) {
+  if (!confirm(`¿Eliminar "${nombre}"?`)) return;
+  await fetch(`/api/datasources/${id}`, { method: 'DELETE' });
+  loadDatasourcesTable();
+}
+
+function openDsModal(ds = null) {
+  document.getElementById('modal-title').textContent = ds ? 'Editar Fuente' : 'Nueva Fuente de Datos';
+  document.getElementById('modal-ds-id').value   = ds ? ds.id : '';
+  document.getElementById('ds-nombre').value     = ds ? ds.nombre : '';
+  document.getElementById('ds-tipo').value       = ds ? ds.tipo_db : 'postgresql';
+  document.getElementById('ds-host').value       = ds ? ds.host : '';
+  document.getElementById('ds-puerto').value     = ds ? ds.puerto : '5432';
+  document.getElementById('ds-usuario').value   = ds ? ds.usuario : '';
+  document.getElementById('ds-password').value  = '';
+  document.getElementById('ds-database').value  = ds ? ds.database : '';
+  document.getElementById('ds-activa').checked  = ds ? ds.activa : true;
+  document.getElementById('test-result').textContent = '';
+  document.getElementById('test-result').className   = 'test-result';
+  document.getElementById('ds-modal').classList.remove('hidden');
+}
+
+function closeDsModal() {
+  document.getElementById('ds-modal').classList.add('hidden');
+}
+
+async function editDs(id) {
+  const res = await fetch('/api/datasources');
+  const list = await res.json();
+  const ds = list.find(d => d.id === id);
+  if (ds) openDsModal(ds);
+}
+
+async function testDsModal() {
+  const body = getDsFormData();
+  const dsId = document.getElementById('modal-ds-id').value;
+  const resultEl = document.getElementById('test-result');
+  resultEl.textContent = '⏳ Probando…';
+  resultEl.className   = 'test-result';
+
+  let res, data;
+  if (dsId) {
+    res  = await fetch(`/api/datasources/${dsId}/test`, { method: 'POST' });
+    data = await res.json();
+  } else {
+    // Save temp then test - just test with a POST create + test + delete
+    res  = await fetch('/api/datasources', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
+    const created = await res.json();
+    if (created.id) {
+      const tres = await fetch(`/api/datasources/${created.id}/test`, { method: 'POST' });
+      data = await tres.json();
+      await fetch(`/api/datasources/${created.id}`, { method: 'DELETE' });
+    } else { data = { ok: false, error: created.error }; }
+  }
+
+  resultEl.textContent = data.ok ? `✅ OK (${data.latency_ms} ms)` : `❌ ${data.error}`;
+  resultEl.className   = 'test-result ' + (data.ok ? 'ok' : 'fail');
+}
+
+function getDsFormData() {
+  return {
+    nombre:   document.getElementById('ds-nombre').value.trim(),
+    tipo_db:  document.getElementById('ds-tipo').value,
+    host:     document.getElementById('ds-host').value.trim(),
+    puerto:   parseInt(document.getElementById('ds-puerto').value),
+    usuario:  document.getElementById('ds-usuario').value.trim(),
+    password: document.getElementById('ds-password').value,
+    database: document.getElementById('ds-database').value.trim(),
+    activa:   document.getElementById('ds-activa').checked,
   };
 }
 
-const qpsChart  = new Chart(document.getElementById('chart-qps'),
-  lineChartConfig('QPS', 'rgb(74,158,255)', history.qps));
-
-const connChart = new Chart(document.getElementById('chart-conn'),
-  lineChartConfig('Conexiones', 'rgb(168,85,247)', history.conn));
-
-const cacheChart = new Chart(document.getElementById('chart-cache'),
-  lineChartConfig('Hit Ratio %', 'rgb(16,214,126)', history.cache, 100));
-
-// DML doughnut
-const dmlChart = new Chart(document.getElementById('chart-dml'), {
-  type: 'doughnut',
-  data: {
-    labels: ['SELECT', 'INSERT', 'UPDATE', 'DELETE'],
-    datasets: [{
-      data: [0, 0, 0, 0],
-      backgroundColor: ['#4a9eff','#10d67e','#f59e0b','#ef4444'],
-      borderWidth: 0,
-      hoverOffset: 8,
-    }]
-  },
-  options: {
-    responsive: true,
-    maintainAspectRatio: false,
-    cutout: '65%',
-    plugins: {
-      legend: {
-        position: 'bottom',
-        labels: { font: { size: 11 }, padding: 14, boxWidth: 10 }
-      }
-    }
+async function saveDsModal() {
+  const data  = getDsFormData();
+  const dsId  = document.getElementById('modal-ds-id').value;
+  const method = dsId ? 'PUT' : 'POST';
+  const url    = dsId ? `/api/datasources/${dsId}` : '/api/datasources';
+  const res    = await fetch(url, {
+    method, headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data)
+  });
+  const result = await res.json();
+  if (res.ok) {
+    closeDsModal();
+    loadDatasourcesTable();
+  } else {
+    alert('Error: ' + (result.error || 'Desconocido'));
   }
+}
+
+// ── SQL Import ─────────────────────────────────────────────────────────────────
+let selectedFile = null;
+
+function onFileSelect(input) {
+  selectedFile = input.files[0] || null;
+  const dropText = document.getElementById('drop-text');
+  if (selectedFile) {
+    dropText.textContent = `📄 ${selectedFile.name} (${(selectedFile.size/1024).toFixed(1)} KB)`;
+    document.getElementById('drop-zone').classList.add('drag-over');
+  } else {
+    dropText.textContent = 'Haz clic o arrastra un archivo .sql aquí';
+    document.getElementById('drop-zone').classList.remove('drag-over');
+  }
+  updateImportBtn();
+}
+
+function updateImportBtn() {
+  const dsId = document.getElementById('import-ds-select').value;
+  document.getElementById('btn-import').disabled = !(selectedFile && dsId);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('import-ds-select').addEventListener('change', updateImportBtn);
+
+  // Drag & drop
+  const dz = document.getElementById('drop-zone');
+  dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag-over'); });
+  dz.addEventListener('dragleave', () => dz.classList.remove('drag-over'));
+  dz.addEventListener('drop', e => {
+    e.preventDefault();
+    const f = e.dataTransfer.files[0];
+    if (f) { selectedFile = f; document.getElementById('drop-text').textContent = `📄 ${f.name}`; updateImportBtn(); }
+  });
 });
 
-// ─────────────────────────────────────────────────────
-// HELPERS
-// ─────────────────────────────────────────────────────
-function fmtSize(mb) {
-  if (mb === null || mb === undefined) return '–';
-  mb = parseFloat(mb);
-  if (mb >= 1024) return (mb / 1024).toFixed(2) + ' GB';
-  return mb.toFixed(2) + ' MB';
-}
+async function runImport() {
+  const dsId = document.getElementById('import-ds-select').value;
+  if (!selectedFile || !dsId) return;
 
-function fmtNum(n) {
-  if (n === null || n === undefined) return '–';
-  return Number(n).toLocaleString('es-MX');
-}
+  const btn = document.getElementById('btn-import');
+  btn.disabled   = true;
+  btn.textContent = '⏳ Importando…';
 
-function statusClass(value, warn, crit, invert = false) {
-  if (invert) {
-    if (value < crit) return 'status-crit';
-    if (value < warn) return 'status-warn';
-    return 'status-ok';
-  }
-  if (value >= crit) return 'status-crit';
-  if (value >= warn) return 'status-warn';
-  return 'status-ok';
-}
+  const form = new FormData();
+  form.append('datasource_id', dsId);
+  form.append('file', selectedFile);
 
-function barColor(cls) {
-  if (cls === 'status-crit') return '#ef4444';
-  if (cls === 'status-warn') return '#f59e0b';
-  return '#10d67e';
-}
+  const resultCard = document.getElementById('import-result');
+  const resultBody = document.getElementById('import-result-body');
+  resultCard.style.display = 'block';
+  resultBody.innerHTML = '<div style="color:var(--text-dim)">Procesando…</div>';
 
-function setKpiStatus(cardId, cls) {
-  const el = document.getElementById(cardId);
-  el.classList.remove('status-ok', 'status-warn', 'status-crit', 'status-blue');
-  el.classList.add(cls);
-}
-
-function now() {
-  return new Date().toLocaleTimeString('es-MX', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-}
-
-// ─────────────────────────────────────────────────────
-// RENDER METRICS
-// ─────────────────────────────────────────────────────
-function renderMetrics(data) {
-  const m = data.metrics;
-  const alerts = data.alerts || [];
-
-  // ── Header ────────────────────────────────────────
-  document.getElementById('hdr-version').textContent = `${m.version}`;
-  document.getElementById('hdr-uptime').textContent  = `⏱ ${m.uptime_str}`;
-  document.getElementById('last-update').textContent = new Date().toLocaleString('es-MX');
-  document.getElementById('conn-status').className   = 'conn-dot dot-ok';
-
-  // ── Alerts ───────────────────────────────────────
-  renderAlerts(alerts);
-
-  // ── KPI: Conexiones ───────────────────────────────
-  const connPct = m.connection_pct;
-  const connCls = statusClass(connPct,
-    THRESHOLDS.connections_warning || 70,
-    THRESHOLDS.connections_critical || 90);
-  document.getElementById('kpi-conn-val').textContent = `${m.threads_connected}/${m.max_connections}`;
-  document.getElementById('kpi-conn-pct').textContent = `${connPct.toFixed(1)}% usado`;
-  setBarWidth('kpi-conn-bar', connPct, barColor(connCls));
-  setKpiStatus('kpi-connections', connCls);
-
-  // ── KPI: QPS ─────────────────────────────────────
-  document.getElementById('kpi-qps-val').textContent = m.qps.toFixed(1);
-  setKpiStatus('kpi-qps', 'status-blue');
-
-  // ── KPI: Cache Hit ────────────────────────────────
-  const cacheCls = statusClass(m.innodb_hit_ratio,
-    THRESHOLDS.cache_hit_warning || 95,
-    THRESHOLDS.cache_hit_critical || 85, true);
-  document.getElementById('kpi-cache-val').textContent = `${m.innodb_hit_ratio.toFixed(2)}%`;
-  setBarWidth('kpi-cache-bar', m.innodb_hit_ratio, barColor(cacheCls));
-  setKpiStatus('kpi-cache', cacheCls);
-
-  // ── KPI: Threads ─────────────────────────────────
-  const thrCls = statusClass(m.threads_running,
-    THRESHOLDS.threads_running_warning || 20,
-    THRESHOLDS.threads_running_critical || 50);
-  document.getElementById('kpi-threads-val').textContent = `${m.threads_running} / ${m.threads_cached}`;
-  setKpiStatus('kpi-threads', thrCls);
-
-  // ── KPI: Slow Queries ─────────────────────────────
-  const slowCls = statusClass(m.slow_queries,
-    THRESHOLDS.slow_queries_warning || 100,
-    THRESHOLDS.slow_queries_critical || 500);
-  document.getElementById('kpi-slow-val').textContent = fmtNum(m.slow_queries);
-  setKpiStatus('kpi-slow', slowCls);
-
-  // ── KPI: Buffer Pool ─────────────────────────────
-  document.getElementById('kpi-bp-val').textContent  = `${m.bp_size_mb} MB`;
-  document.getElementById('kpi-bp-sub').textContent  = `${m.bp_used_pct.toFixed(1)}% utilizado`;
-  setBarWidth('kpi-bp-bar', m.bp_used_pct, '#a855f7');
-  setKpiStatus('kpi-bp', 'status-blue');
-
-  // ── Charts history ────────────────────────────────
-  const ts = now();
-  pushHistory(ts, m.qps, m.threads_connected, m.innodb_hit_ratio);
-
-  // ── DML chart ─────────────────────────────────────
-  dmlChart.data.datasets[0].data = [m.com_select, m.com_insert, m.com_update, m.com_delete];
-  dmlChart.update('none');
-
-  // ── Processlist ───────────────────────────────────
-  renderProcesses(m.processes);
-
-  // ── DB sizes ─────────────────────────────────────
-  renderDbSizes(m.db_sizes);
-
-  // ── Top tables ───────────────────────────────────
-  renderTopTables(m.top_tables);
-
-  // ── Replication ───────────────────────────────────
-  renderReplication(m.replication);
-}
-
-function renderConnectedServers(services, statusMap) {
-  const tbody = document.getElementById('srv-body');
-  const connected = (services || []).filter(s => statusMap?.[s.id]?.connected);
-  document.getElementById('srv-connected-count').textContent = connected.length;
-
-  if (!connected.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty-row">Sin servicios conectados</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = connected.map(s => {
-    const st = statusMap?.[s.id];
-    return `<tr>
-      <td style="color:var(--text)">${s.name}</td>
-      <td>${s.type}</td>
-      <td>${s.region}</td>
-      <td>${s.host}:${s.port}</td>
-      <td><span class="matrix-ok">${st?.status || 'connected'}</span></td>
-    </tr>`;
-  }).join('');
-}
-
-function renderConnectivityMatrix(matrix) {
-  const box = document.getElementById('connectivity-matrix');
-  const rows = Object.keys(matrix || {});
-
-  if (!rows.length) {
-    box.innerHTML = '<div class="empty-row">Sin datos de conectividad</div>';
-    return;
-  }
-
-  const cols = Object.keys(matrix[rows[0]] || {});
-  const head = cols.map(c => `<th>${c}</th>`).join('');
-
-  const body = rows.map(r => {
-    const cells = cols.map(c => {
-      const ok = !!matrix[r][c];
-      return `<td class="${ok ? 'matrix-ok' : 'matrix-ko'}">${ok ? '✓' : '✗'}</td>`;
-    }).join('');
-    return `<tr><td>${r}</td>${cells}</tr>`;
-  }).join('');
-
-  box.innerHTML = `<table class="matrix-table"><thead><tr><th>Desde \\ Hacia</th>${head}</tr></thead><tbody>${body}</tbody></table>`;
-}
-
-function renderSummary(summary) {
-  if (!summary || !summary.services || !summary.connectivity) return;
-  document.getElementById('sum-total').textContent = summary.services.total ?? '–';
-  document.getElementById('sum-active').textContent = summary.services.active ?? '–';
-  document.getElementById('sum-connected').textContent = summary.services.connected ?? '–';
-  document.getElementById('sum-healthy').textContent = summary.connectivity.healthy ? 'OK' : 'DEGRADED';
-}
-
-async function fetchServicesSummary() {
   try {
-    const [activeRes, statusRes, matrixRes, summaryRes] = await Promise.all([
-      fetch('/api/services/active'),
-      fetch('/api/connectivity/status'),
-      fetch('/api/connectivity/matrix'),
-      fetch('/api/summary'),
-    ]);
-
-    if (!activeRes.ok || !statusRes.ok || !matrixRes.ok || !summaryRes.ok) return;
-
-    const activeData = await activeRes.json();
-    const statusData = await statusRes.json();
-    const matrixData = await matrixRes.json();
-    const summaryData = await summaryRes.json();
-
-    renderConnectedServers(activeData.services || [], statusData || {});
-    renderConnectivityMatrix(matrixData || {});
-    renderSummary(summaryData || {});
-  } catch (e) {
-    console.error('Fetch services/summary error:', e);
-  }
-}
-
-function setBarWidth(id, pct, color) {
-  const el = document.getElementById(id);
-  if (!el) return;
-  el.style.width  = Math.min(pct, 100) + '%';
-  el.style.background = color;
-}
-
-function pushHistory(label, qps, conn, cache) {
-  history.labels.push(label);
-  history.qps.push(qps);
-  history.conn.push(conn);
-  history.cache.push(cache);
-
-  if (history.labels.length > historyLen) {
-    history.labels.shift();
-    history.qps.shift();
-    history.conn.shift();
-    history.cache.shift();
-  }
-
-  qpsChart.update('none');
-  connChart.update('none');
-  cacheChart.update('none');
-}
-
-// ─────────────────────────────────────────────────────
-// RENDER HELPERS
-// ─────────────────────────────────────────────────────
-function renderAlerts(alerts) {
-  const bar   = document.getElementById('alert-bar');
-  const badge = document.getElementById('alert-badge');
-  const count = document.getElementById('alert-count');
-
-  if (!alerts.length) {
-    bar.classList.add('hidden');
-    badge.classList.add('hidden');
-    return;
-  }
-
-  badge.classList.remove('hidden');
-  count.textContent = alerts.length;
-
-  const hasCrit = alerts.some(a => a.severity === 'CRITICAL');
-  bar.classList.remove('hidden', 'warn-only');
-  if (!hasCrit) bar.classList.add('warn-only');
-
-  bar.innerHTML = alerts.map(a =>
-    `<span class="alert-pill ${a.severity}">
-      ${a.severity === 'CRITICAL' ? '🔴' : '🟡'} <strong>${a.metric}</strong>: ${a.value}
-      <span style="opacity:0.6;font-size:10px">(${a.threshold})</span>
-    </span>`
-  ).join('');
-}
-
-function renderProcesses(procs) {
-  const tbody = document.getElementById('proc-body');
-  document.getElementById('proc-count').textContent = procs.length;
-
-  if (!procs.length) {
-    tbody.innerHTML = '<tr><td colspan="7" class="empty-row">Sin procesos activos</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = procs.map(p => {
-    const t = parseInt(p.TIME) || 0;
-    const tcls = t > 30 ? 'time-crit' : t > 10 ? 'time-warn' : 'time-ok';
-    return `<tr>
-      <td>${p.ID}</td>
-      <td>${p.USER || ''}</td>
-      <td>${p.DB || '–'}</td>
-      <td>${p.COMMAND || ''}</td>
-      <td class="${tcls}">${t}s</td>
-      <td>${p.STATE || ''}</td>
-      <td title="${(p.INFO||'').replace(/"/g,"'")}">
-        ${(p.INFO || '').substring(0, 60)}${(p.INFO||'').length > 60 ? '…' : ''}
-      </td>
-    </tr>`;
-  }).join('');
-}
-
-function renderDbSizes(sizes) {
-  const tbody = document.getElementById('db-body');
-  if (!sizes || !sizes.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty-row">Sin bases de datos</td></tr>';
-    return;
-  }
-
-  const maxMb = Math.max(...sizes.map(d => parseFloat(d.size_mb) || 0), 1);
-
-  tbody.innerHTML = sizes.map(db => {
-    const mb   = parseFloat(db.size_mb) || 0;
-    const pct  = ((mb / maxMb) * 100).toFixed(1);
-    const col  = mb > 500 ? '#ef4444' : mb > 100 ? '#f59e0b' : '#4a9eff';
-    return `<tr>
-      <td style="color:var(--text)">${db.db_name}</td>
-      <td>${fmtSize(mb)}</td>
-      <td>${fmtNum(db.tables)}</td>
-      <td>${fmtNum(db.rows_est)}</td>
-      <td>
-        <span class="mini-bar-wrap">
-          <span class="mini-bar-fill" style="width:${pct}%;background:${col}"></span>
-        </span>
-        <span style="font-size:10px;margin-left:4px;color:var(--text-dim)">${pct}%</span>
-      </td>
-    </tr>`;
-  }).join('');
-}
-
-function renderTopTables(tables) {
-  const tbody = document.getElementById('tbl-body');
-  if (!tables || !tables.length) {
-    tbody.innerHTML = '<tr><td colspan="5" class="empty-row">Sin tablas</td></tr>';
-    return;
-  }
-
-  tbody.innerHTML = tables.map(t => `<tr>
-    <td>${t.db_name}</td>
-    <td style="color:var(--text)">${t.table_name}</td>
-    <td><span style="color:var(--accent-blue)">${t.engine || '?'}</span></td>
-    <td>${fmtSize(t.size_mb)}</td>
-    <td>${fmtNum(t.rows_est)}</td>
-  </tr>`).join('');
-}
-
-function renderReplication(rep) {
-  const section = document.getElementById('replication-section');
-  if (!rep) { section.classList.add('hidden'); return; }
-  section.classList.remove('hidden');
-
-  const ioOk  = rep.Slave_IO_Running  === 'Yes';
-  const sqlOk = rep.Slave_SQL_Running === 'Yes';
-  const lag   = rep.Seconds_Behind_Master;
-
-  document.getElementById('repl-io').innerHTML =
-    `<span style="color:${ioOk?'var(--accent-green)':'var(--accent-red)'}">
-      ${ioOk ? '✔ Running' : '✘ Stopped'}</span>`;
-
-  document.getElementById('repl-sql').innerHTML =
-    `<span style="color:${sqlOk?'var(--accent-green)':'var(--accent-red)'}">
-      ${sqlOk ? '✔ Running' : '✘ Stopped'}</span>`;
-
-  const lagNum = parseInt(lag) || 0;
-  const lagColor = lagNum >= 30 ? 'var(--accent-red)' : lagNum >= 10 ? 'var(--accent-yellow)' : 'var(--accent-green)';
-  document.getElementById('repl-lag').innerHTML =
-    `<span style="color:${lagColor}">${lag !== null ? lagNum + 's' : 'N/A'}</span>`;
-
-  document.getElementById('repl-host').textContent = rep.Master_Host || '?';
-}
-
-// ─────────────────────────────────────────────────────
-// COUNTDOWN RING
-// ─────────────────────────────────────────────────────
-const CIRC = 94.2;
-let countdownInterval = null;
-
-function startCountdown() {
-  countdown = REFRESH;
-  if (countdownInterval) clearInterval(countdownInterval);
-  countdownInterval = setInterval(() => {
-    countdown--;
-    const frac = countdown / REFRESH;
-    const offset = CIRC * (1 - frac);
-    const ring = document.getElementById('ring-progress');
-    if (ring) ring.style.strokeDasharray = `${CIRC * frac} ${CIRC}`;
-    const numEl = document.getElementById('countdown-num');
-    if (numEl) numEl.textContent = Math.max(0, countdown);
-    if (countdown <= 0) clearInterval(countdownInterval);
-  }, 1000);
-}
-
-// ─────────────────────────────────────────────────────
-// FETCH LOOP
-// ─────────────────────────────────────────────────────
-async function fetchMetrics() {
-  const connDot = document.getElementById('conn-status');
-  try {
-    const res = await fetch('/api/metrics');
-    if (res.status === 202) {
-      connDot.className = 'conn-dot dot-loading';
-      return;
-    }
-    if (!res.ok) {
-      connDot.className = 'conn-dot dot-error';
-      return;
-    }
+    const res  = await fetch('/api/import-sql', { method: 'POST', body: form });
     const data = await res.json();
-    if (data.error) {
-      connDot.className = 'conn-dot dot-error';
-      document.getElementById('hdr-version').textContent = data.error;
+
+    if (!res.ok) {
+      resultBody.innerHTML = `<div style="color:var(--red)">❌ ${data.error}</div>`;
+    } else {
+      const ok  = data.status === 'success';
+      resultBody.innerHTML = `
+        <div class="result-stat"><span>Estado</span><strong style="color:${ok?'var(--green)':'var(--red)'}">${ok ? '✅ Éxito' : '❌ Fallido'}</strong></div>
+        <div class="result-stat"><span>Sentencias OK</span><strong>${data.statements_ok}</strong></div>
+        <div class="result-stat"><span>Sentencias fallidas</span><strong>${data.statements_failed}</strong></div>
+        <div class="result-stat"><span>Total</span><strong>${data.total_statements}</strong></div>
+        ${data.errors && data.errors.length ? `<div class="result-errors">${data.errors.join('\n')}</div>` : ''}
+      `;
+    }
+    loadImportHistory();
+  } catch (e) {
+    resultBody.innerHTML = `<div style="color:var(--red)">Error de red: ${e.message}</div>`;
+  }
+
+  btn.disabled   = false;
+  btn.textContent = '▶ Ejecutar importación';
+}
+
+async function loadImportHistory() {
+  const tbody = document.getElementById('import-history-body');
+  try {
+    const res  = await fetch('/api/import-history');
+    const rows = await res.json();
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty-row">Sin importaciones</td></tr>';
       return;
     }
-    connDot.className = 'conn-dot dot-ok';
-    renderMetrics(data);
-  } catch (e) {
-    connDot.className = 'conn-dot dot-error';
-    console.error('Fetch error:', e);
+    tbody.innerHTML = rows.map(r => {
+      const st = r.status;
+      const cls = st === 'success' ? 'pill-ok' : st === 'blocked' ? 'pill-warn' : 'pill-crit';
+      const ts  = r.uploaded_at ? new Date(r.uploaded_at).toLocaleString() : '–';
+      return `<tr>
+        <td style="font-size:0.75rem">${ts}</td>
+        <td>${r.ds_nombre || 'DS #'+r.datasource_id}</td>
+        <td style="font-family:monospace;font-size:0.75rem">${r.filename}</td>
+        <td><span class="pill ${cls}">${st}</span></td>
+        <td>${r.statements_ok}</td>
+        <td>${r.statements_failed}</td>
+        <td style="font-size:0.72rem;color:var(--red);max-width:200px;overflow:hidden;text-overflow:ellipsis">${r.error_message || ''}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) {
+    tbody.innerHTML = `<tr><td colspan="7" class="empty-row">Error: ${e.message}</td></tr>`;
   }
 }
 
-async function init() {
-  // Cargar config de thresholds
+// ── Init ───────────────────────────────────────────────────────────────────────
+(async () => {
+  // Get config first
   try {
-    const cfg = await fetch('/api/config').then(r => r.json());
-    REFRESH    = cfg.refresh_interval || 5;
-    THRESHOLDS = cfg.thresholds || {};
-  } catch (_) {}
+    const cfg = await (await fetch('/api/config')).json();
+    REFRESH_MS = (cfg.refresh_interval || 30) * 1000;
+  } catch(e) {}
 
-  // Primera carga
-  await fetchMetrics();
-  await fetchServicesSummary();
-  startCountdown();
-
-  // Polling
-  setInterval(async () => {
-    await fetchMetrics();
-    await fetchServicesSummary();
-    startCountdown();
-  }, REFRESH * 1000);
-}
-
-document.addEventListener('DOMContentLoaded', init);
+  initCharts();
+  startLoop();
+})();

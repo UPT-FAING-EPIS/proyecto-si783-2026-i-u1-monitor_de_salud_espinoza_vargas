@@ -1,6 +1,3 @@
-# Credenciales locales — NO subir al repositorio
-config.ini
-
 # Python
 __pycache__/
 *.pyc
