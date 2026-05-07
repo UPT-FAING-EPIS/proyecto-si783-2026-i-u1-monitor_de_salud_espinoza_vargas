@@ -108,16 +108,15 @@ jobs:
           echo "Esperando app en: $APP_URL"
           for i in $(seq 1 20); do
             CODE=$(curl -s -o /dev/null -w "%{http_code}" "${APP_URL}/api/health" || echo "000")
-            echo "  Intento ${i}/20 — HTTP ${CODE}"
+            echo "  Intento ${i}/20 - HTTP ${CODE}"
             if [ "$CODE" = "200" ]; then
-              echo "✅ App respondiendo"
-              echo ""
-              echo "🌐 Dashboard: ${APP_URL}"
+              echo "[OK] App respondiendo correctamente"
+              echo "Dashboard: ${APP_URL}"
               exit 0
             fi
             sleep 15
           done
-          echo "⚠ Health check no pasó, revisar logs de Azure"
+          echo "[WARN] Health check no paso, revisar logs de Azure"
 
       - name: Mostrar URL
-        run: echo "Dashboard: https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
+        run: echo "Dashboard disponible en https://${{ steps.names.outputs.webapp }}.azurewebsites.net"
