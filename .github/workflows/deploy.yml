@@ -122,33 +122,44 @@ jobs:
       # deploys only the web application.
 
       # ── Web App ──────────────────────────────────────────────
-      - name: Crear Web App (si no existe)
+      - name: Recreate Web App (delete if exists)
         run: |
           APP="${{ steps.names.outputs.webapp }}"
-          EXISTS=$(az webapp show \
-            --name "$APP" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "name" -o tsv 2>/dev/null || true)
+          RG="${{ env.RESOURCE_GROUP }}"
 
-          if [ -z "$EXISTS" ]; then
-            az webapp create \
-              --name           "$APP" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --plan           "${{ steps.names.outputs.plan }}" \
-              --runtime        "PYTHON|3.11" \
-              --output none
-            echo "Web App creada: ${APP}"
-          else
-            echo "Web App ya existe: ${APP}"
+          EXISTS=$(az webapp show --name "$APP" --resource-group "$RG" --query "name" -o tsv 2>/dev/null || true)
+
+          if [ -n "$EXISTS" ]; then
+            echo "Web App $APP already exists. Deleting..."
+            az webapp delete --name "$APP" --resource-group "$RG" --yes || true
+            echo "Deleted $APP. Waiting a few seconds before recreate..."
+            sleep 8
           fi
 
+          echo "Creating Web App ${APP}..."
+          az webapp create \
+            --name           "$APP" \
+            --resource-group "$RG" \
+            --plan           "${{ steps.names.outputs.plan }}" \
+            --runtime        "PYTHON|3.11" \
+            --output none
+
+          echo "Web App created: ${APP}"
+
       # ── App Settings ─────────────────────────────────────────
-      - name: Configurar App Settings (sin crear DB)
+      - name: Configurar App Settings (usar ELASTIKA_DATABASE_URL)
         run: |
+          # El workflow espera que exista el secret ELASTIKA_DATABASE_URL
+          if [ -z "${{ secrets.ELASTIKA_DATABASE_URL }}" ]; then
+            echo "ERROR: El secret ELASTIKA_DATABASE_URL no existe. Crea el secret en GitHub antes de ejecutar el workflow." >&2
+            exit 1
+          fi
+
           az webapp config appsettings set \
             --name           "${{ steps.names.outputs.webapp }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --settings \
+              DATABASE_URL="${{ secrets.ELASTIKA_DATABASE_URL }}" \
               WEBSITES_PORT="5000" \
               SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
             --output none
