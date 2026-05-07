@@ -117,57 +117,9 @@ jobs:
             exit 1
           fi
 
-      # ── Registrar proveedor PostgreSQL ──────────────────────
-      - name: Registrar proveedor Microsoft.DBforPostgreSQL
-        run: |
-          STATE=$(az provider show --namespace Microsoft.DBforPostgreSQL --query "registrationState" -o tsv 2>/dev/null || echo "NotRegistered")
-          if [ "$STATE" != "Registered" ]; then
-            echo "Registrando Microsoft.DBforPostgreSQL (puede tardar ~2 min)..."
-            az provider register --namespace Microsoft.DBforPostgreSQL --wait
-            echo "✔ Proveedor registrado."
-          else
-            echo "✔ Microsoft.DBforPostgreSQL ya estaba registrado."
-          fi
-
-      # ── PostgreSQL Flexible Server ───────────────────────────
-      - name: Crear PostgreSQL Flexible Server (si no existe)
-        id: postgres
-        run: |
-          PG="${{ steps.names.outputs.pgserver }}"
-          REGION="${{ steps.infra.outputs.resolved_location }}"
-
-          EXISTS=$(az postgres flexible-server show \
-            --name "$PG" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --query "name" -o tsv 2>/dev/null || true)
-
-          if [ -z "$EXISTS" ]; then
-            echo "Creando PostgreSQL server: ${PG} en ${REGION}..."
-            az postgres flexible-server create \
-              --name           "$PG" \
-              --resource-group "${{ env.RESOURCE_GROUP }}" \
-              --location       "${REGION}" \
-              --admin-user     "${{ env.PG_ADMIN_USER }}" \
-              --admin-password "${{ steps.names.outputs.pg_pass }}" \
-              --sku-name       "Standard_B1ms" \
-              --tier           "Burstable" \
-              --public-access  "0.0.0.0" \
-              --storage-size   32 \
-              --version        16 \
-              --output none
-            echo "PostgreSQL server creado: ${PG}"
-          else
-            echo "PostgreSQL server ya existe: ${PG}"
-          fi
-
-          # Crear base de datos si no existe
-          az postgres flexible-server db create \
-            --server-name    "$PG" \
-            --resource-group "${{ env.RESOURCE_GROUP }}" \
-            --database-name  "${{ env.PG_DB_NAME }}" \
-            --output none 2>/dev/null || true
-
-          echo "pg_host=${PG}.postgres.database.azure.com" >> $GITHUB_OUTPUT
+      # NOTE: PostgreSQL server creation is skipped because the database
+      # will be hosted externally (on the Elastika VM). The workflow
+      # deploys only the web application.
 
       # ── Web App ──────────────────────────────────────────────
       - name: Crear Web App (si no existe)
@@ -191,19 +143,12 @@ jobs:
           fi
 
       # ── App Settings ─────────────────────────────────────────
-      - name: Configurar App Settings
+      - name: Configurar App Settings (sin crear DB)
         run: |
-          PG_HOST="${{ steps.postgres.outputs.pg_host }}"
-          PG_PASS="${{ steps.names.outputs.pg_pass }}"
-          DB_URL="postgresql://${{ env.PG_ADMIN_USER }}:${PG_PASS}@${PG_HOST}/${{ env.PG_DB_NAME }}?sslmode=require"
-
           az webapp config appsettings set \
             --name           "${{ steps.names.outputs.webapp }}" \
             --resource-group "${{ env.RESOURCE_GROUP }}" \
             --settings \
-              DATABASE_URL="${DB_URL}" \
-              PGHOST="${PG_HOST}" \
-              PGDATABASE="${{ env.PG_DB_NAME }}" \
               WEBSITES_PORT="5000" \
               SCM_DO_BUILD_DURING_DEPLOYMENT="true" \
             --output none

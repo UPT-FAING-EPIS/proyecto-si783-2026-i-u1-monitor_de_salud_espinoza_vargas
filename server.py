@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Monitor de Salud DB — Backend Flask con PostgreSQL.
-Métricas reales: pg_stat_database + psutil (CPU/RAM/disco)
-+ contadores internos de queries y tiempo de respuesta.
+Monitor de Salud DB — Backend Flask con MySQL/PostgreSQL.
+Métricas reales: Estado de BD + psutil (CPU/RAM/disco)
++ Gestión de múltiples servicios y conectividad.
 """
 
 import os
@@ -17,8 +17,15 @@ try:
     import psutil
     _PSUTIL_OK = True
 except Exception:
-    psutil = None  # type: ignore
+    psutil = None
     _PSUTIL_OK = False
+
+try:
+    import mysql.connector
+    _MYSQL_OK = True
+except ImportError:
+    mysql = None
+    _MYSQL_OK = False
 
 try:
     import psycopg2
@@ -33,6 +40,10 @@ except ImportError as e:
 from flask import Flask, jsonify, render_template
 from flask_cors import CORS
 
+# Importar gestores de servicios y conexiones
+from db_connection import init_pool, get_connection, execute_query, test_connection as test_mysql_connection
+from services import get_service_manager, get_connectivity_checker
+
 # ─────────────────────────────────────────────────────────────
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("db_monitor")
@@ -43,6 +54,10 @@ CORS(app)
 BASE_DIR     = Path(__file__).parent
 CONFIG_FILE  = BASE_DIR / "config.ini"
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+# Inicializar gestores
+service_manager = get_service_manager()
+connectivity_checker = get_connectivity_checker()
 
 try:
     _proc = psutil.Process() if _PSUTIL_OK else None
@@ -581,6 +596,142 @@ def api_config():
             "cpu_critical":             cfg.getfloat("thresholds", "cpu_critical",             fallback=90),
             "mem_warning":              cfg.getfloat("thresholds", "mem_warning",              fallback=80),
             "mem_critical":             cfg.getfloat("thresholds", "mem_critical",             fallback=95),
+        }
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# RUTAS DE SERVICIOS - GESTIÓN Y CONECTIVIDAD
+# ─────────────────────────────────────────────────────────────
+@app.route("/api/services")
+def api_services():
+    """Obtiene lista de todos los servicios disponibles."""
+    services = service_manager.get_all_services()
+    return {
+        "services": [s.to_dict() for s in services],
+        "total": len(services),
+        "active": len(service_manager.get_active_services())
+    }
+
+
+@app.route("/api/services/active")
+def api_services_active():
+    """Obtiene lista de servicios activos."""
+    services = service_manager.get_active_services()
+    return {
+        "services": [s.to_dict() for s in services],
+        "count": len(services)
+    }
+
+
+@app.route("/api/services/<service_id>")
+def api_service_detail(service_id: str):
+    """Obtiene detalles de un servicio específico."""
+    service = service_manager.get_service(service_id)
+    if not service:
+        return {"error": f"Servicio '{service_id}' no encontrado"}, 404
+    return service.to_dict()
+
+
+@app.route("/api/services/type/<service_type>")
+def api_services_by_type(service_type: str):
+    """Obtiene servicios de un tipo específico."""
+    valid_types = ["mysql", "postgresql", "sqlserver", "elasticsearch"]
+    if service_type not in valid_types:
+        return {"error": f"Tipo inválido. Válidos: {', '.join(valid_types)}"}, 400
+    
+    services = service_manager.get_services_by_type(service_type)
+    return {
+        "type": service_type,
+        "services": [s.to_dict() for s in services],
+        "count": len(services)
+    }
+
+
+@app.route("/api/services/region/<region>")
+def api_services_by_region(region: str):
+    """Obtiene servicios de una región específica."""
+    valid_regions = ["local", "azure", "elastika", "aws"]
+    if region not in valid_regions:
+        return {"error": f"Región inválida. Válidas: {', '.join(valid_regions)}"}, 400
+    
+    services = service_manager.get_services_by_region(region)
+    return {
+        "region": region,
+        "services": [s.to_dict() for s in services],
+        "count": len(services)
+    }
+
+
+@app.route("/api/services/<service_id>/enable", methods=["POST"])
+def api_enable_service(service_id: str):
+    """Activa un servicio."""
+    if service_manager.enable_service(service_id):
+        service = service_manager.get_service(service_id)
+        return {"status": "activated", "service": service.to_dict()}
+    return {"error": f"Servicio '{service_id}' no encontrado"}, 404
+
+
+@app.route("/api/services/<service_id>/disable", methods=["POST"])
+def api_disable_service(service_id: str):
+    """Desactiva un servicio."""
+    if service_manager.disable_service(service_id):
+        service = service_manager.get_service(service_id)
+        return {"status": "deactivated", "service": service.to_dict()}
+    return {"error": f"Servicio '{service_id}' no encontrado"}, 404
+
+
+@app.route("/api/connectivity/status")
+def api_connectivity_status():
+    """Verifica el estado de conexión de todos los servicios."""
+    results = connectivity_checker.check_all_connections()
+    status_map = {}
+    for service_id, connected in results.items():
+        service = service_manager.get_service(service_id)
+        status_map[service_id] = {
+            "name": service.name,
+            "connected": connected,
+            "status": service.status,
+            "last_check": service.last_check
+        }
+    return status_map
+
+
+@app.route("/api/connectivity/matrix")
+def api_connectivity_matrix():
+    """Obtiene la matriz de conectividad entre servicios."""
+    matrix = connectivity_checker.check_inter_service_connectivity()
+    formatted_matrix = {}
+    for from_id, connections in matrix.items():
+        from_service = service_manager.get_service(from_id)
+        formatted_matrix[from_service.name] = {}
+        for to_id, connected in connections.items():
+            to_service = service_manager.get_service(to_id)
+            formatted_matrix[from_service.name][to_service.name] = connected
+    return formatted_matrix
+
+
+@app.route("/api/summary")
+def api_summary():
+    """Obtiene un resumen del estado del sistema completo."""
+    manager_info = service_manager.to_dict()
+    connectivity_status = connectivity_checker.check_all_connections()
+    
+    connected_count = sum(1 for v in connectivity_status.values() if v)
+    
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "services": {
+            "total": manager_info["summary"]["total_services"],
+            "active": manager_info["summary"]["active_services"],
+            "connected": connected_count,
+            "by_type": manager_info["summary"]["by_type"],
+            "by_region": manager_info["summary"]["by_region"]
+        },
+        "connectivity": {
+            "status": connectivity_status,
+            "matrix": connectivity_checker.check_inter_service_connectivity(),
+            "healthy": connected_count == manager_info["summary"]["active_services"]
         }
     }
 
