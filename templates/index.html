@@ -181,6 +181,41 @@
     </div>
   </section>
 
+  <!-- SERVERS + CONNECTIVITY -->
+  <section class="services-grid">
+    <div class="glass-card">
+      <h3 class="card-title">🌐 Servidores Conectados <span id="srv-connected-count" class="badge-sm">0</span></h3>
+      <div class="table-wrap">
+        <table class="data-table" id="srv-table">
+          <thead>
+            <tr><th>Servicio</th><th>Tipo</th><th>Región</th><th>Host</th><th>Estado</th></tr>
+          </thead>
+          <tbody id="srv-body"><tr><td colspan="5" class="empty-row">Cargando…</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="glass-card">
+      <h3 class="card-title">🧭 Conectividad Entre Servidores</h3>
+      <div id="connectivity-matrix" class="matrix-wrap">
+        <div class="empty-row">Cargando matriz…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SYSTEM SUMMARY -->
+  <section class="summary-grid">
+    <div class="glass-card">
+      <h3 class="card-title">🧾 Resumen del Sistema</h3>
+      <div class="summary-cards">
+        <div class="summary-item"><span>Total</span><strong id="sum-total">–</strong></div>
+        <div class="summary-item"><span>Activos</span><strong id="sum-active">–</strong></div>
+        <div class="summary-item"><span>Conectados</span><strong id="sum-connected">–</strong></div>
+        <div class="summary-item"><span>Salud general</span><strong id="sum-healthy">–</strong></div>
+      </div>
+    </div>
+  </section>
+
   <!-- REPLICATION (condicional) -->
   <section id="replication-section" class="hidden">
     <div class="glass-card repl-card">

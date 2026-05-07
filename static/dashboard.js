@@ -143,7 +143,7 @@ function renderMetrics(data) {
   const alerts = data.alerts || [];
 
   // ── Header ────────────────────────────────────────
-  document.getElementById('hdr-version').textContent = `MySQL ${m.version}`;
+  document.getElementById('hdr-version').textContent = `${m.version}`;
   document.getElementById('hdr-uptime').textContent  = `⏱ ${m.uptime_str}`;
   document.getElementById('last-update').textContent = new Date().toLocaleString('es-MX');
   document.getElementById('conn-status').className   = 'conn-dot dot-ok';
@@ -212,6 +212,83 @@ function renderMetrics(data) {
 
   // ── Replication ───────────────────────────────────
   renderReplication(m.replication);
+}
+
+function renderConnectedServers(services, statusMap) {
+  const tbody = document.getElementById('srv-body');
+  const connected = (services || []).filter(s => statusMap?.[s.id]?.connected);
+  document.getElementById('srv-connected-count').textContent = connected.length;
+
+  if (!connected.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty-row">Sin servicios conectados</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = connected.map(s => {
+    const st = statusMap?.[s.id];
+    return `<tr>
+      <td style="color:var(--text)">${s.name}</td>
+      <td>${s.type}</td>
+      <td>${s.region}</td>
+      <td>${s.host}:${s.port}</td>
+      <td><span class="matrix-ok">${st?.status || 'connected'}</span></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderConnectivityMatrix(matrix) {
+  const box = document.getElementById('connectivity-matrix');
+  const rows = Object.keys(matrix || {});
+
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty-row">Sin datos de conectividad</div>';
+    return;
+  }
+
+  const cols = Object.keys(matrix[rows[0]] || {});
+  const head = cols.map(c => `<th>${c}</th>`).join('');
+
+  const body = rows.map(r => {
+    const cells = cols.map(c => {
+      const ok = !!matrix[r][c];
+      return `<td class="${ok ? 'matrix-ok' : 'matrix-ko'}">${ok ? '✓' : '✗'}</td>`;
+    }).join('');
+    return `<tr><td>${r}</td>${cells}</tr>`;
+  }).join('');
+
+  box.innerHTML = `<table class="matrix-table"><thead><tr><th>Desde \\ Hacia</th>${head}</tr></thead><tbody>${body}</tbody></table>`;
+}
+
+function renderSummary(summary) {
+  if (!summary || !summary.services || !summary.connectivity) return;
+  document.getElementById('sum-total').textContent = summary.services.total ?? '–';
+  document.getElementById('sum-active').textContent = summary.services.active ?? '–';
+  document.getElementById('sum-connected').textContent = summary.services.connected ?? '–';
+  document.getElementById('sum-healthy').textContent = summary.connectivity.healthy ? 'OK' : 'DEGRADED';
+}
+
+async function fetchServicesSummary() {
+  try {
+    const [activeRes, statusRes, matrixRes, summaryRes] = await Promise.all([
+      fetch('/api/services/active'),
+      fetch('/api/connectivity/status'),
+      fetch('/api/connectivity/matrix'),
+      fetch('/api/summary'),
+    ]);
+
+    if (!activeRes.ok || !statusRes.ok || !matrixRes.ok || !summaryRes.ok) return;
+
+    const activeData = await activeRes.json();
+    const statusData = await statusRes.json();
+    const matrixData = await matrixRes.json();
+    const summaryData = await summaryRes.json();
+
+    renderConnectedServers(activeData.services || [], statusData || {});
+    renderConnectivityMatrix(matrixData || {});
+    renderSummary(summaryData || {});
+  } catch (e) {
+    console.error('Fetch services/summary error:', e);
+  }
 }
 
 function setBarWidth(id, pct, color) {
@@ -423,11 +500,13 @@ async function init() {
 
   // Primera carga
   await fetchMetrics();
+  await fetchServicesSummary();
   startCountdown();
 
   // Polling
   setInterval(async () => {
     await fetchMetrics();
+    await fetchServicesSummary();
     startCountdown();
   }, REFRESH * 1000);
 }

@@ -234,8 +234,12 @@ class ConnectivityChecker:
     def check_postgresql_connection(self, service: Service) -> bool:
         """Verifica conexión a PostgreSQL."""
         try:
-            import psycopg2
-            conn = psycopg2.connect(
+            try:
+                import psycopg2 as pg_driver
+            except ImportError:
+                import psycopg as pg_driver
+
+            conn = pg_driver.connect(
                 host=service.host,
                 port=service.port,
                 user=service.username,

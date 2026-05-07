@@ -10,6 +10,7 @@ import threading
 import time
 import logging
 import configparser
+from urllib.parse import quote_plus
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -29,13 +30,17 @@ except ImportError:
 
 try:
     import psycopg2
-    import psycopg2.extras
     _PSYCOPG2_OK = True
     _PSYCOPG2_ERR = None
 except ImportError as e:
-    psycopg2 = None
-    _PSYCOPG2_OK = False
-    _PSYCOPG2_ERR = str(e)
+    try:
+        import psycopg as psycopg2
+        _PSYCOPG2_OK = True
+        _PSYCOPG2_ERR = None
+    except ImportError:
+        psycopg2 = None
+        _PSYCOPG2_OK = False
+        _PSYCOPG2_ERR = str(e)
 
 from flask import Flask, jsonify, render_template
 from flask_cors import CORS
@@ -53,7 +58,7 @@ CORS(app)
 
 BASE_DIR     = Path(__file__).parent
 CONFIG_FILE  = BASE_DIR / "config.ini"
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
+DATABASE_URL = ""
 
 # Inicializar gestores
 service_manager = get_service_manager()
@@ -90,6 +95,30 @@ def load_config() -> configparser.ConfigParser:
     if CONFIG_FILE.exists():
         cfg.read(CONFIG_FILE, encoding="utf-8")
     return cfg
+
+
+def resolve_database_url() -> str:
+    """Obtiene DATABASE_URL desde entorno o construye una usando config.ini."""
+    env_url = os.environ.get("DATABASE_URL", "").strip()
+    if env_url:
+        return env_url
+
+    cfg = load_config()
+    if not cfg.has_section("postgresql"):
+        return ""
+
+    host = cfg.get("postgresql", "host", fallback="").strip()
+    port = cfg.get("postgresql", "port", fallback="5432").strip()
+    user = cfg.get("postgresql", "user", fallback="").strip()
+    password = cfg.get("postgresql", "password", fallback="")
+    database = cfg.get("postgresql", "database", fallback="").strip()
+
+    if not host or not user or not database:
+        return ""
+
+    user_enc = quote_plus(user)
+    pass_enc = quote_plus(password)
+    return f"postgresql://{user_enc}:{pass_enc}@{host}:{port}/{database}"
 
 
 # ─────────────────────────────────────────────────────────────
@@ -740,6 +769,9 @@ def api_summary():
 # MAIN
 # ─────────────────────────────────────────────────────────────
 def startup():
+    global DATABASE_URL
+    DATABASE_URL = resolve_database_url()
+
     log.info("=== DB Health Monitor (PostgreSQL) arrancando ===")
     log.info("DATABASE_URL host: %s",
              DATABASE_URL.split("@")[-1].split("/")[0] if "@" in DATABASE_URL else "(no configurada)")
