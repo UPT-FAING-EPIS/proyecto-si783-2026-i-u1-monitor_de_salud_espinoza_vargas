@@ -3,3 +3,6 @@ flask-cors==5.0.0
 gunicorn==23.0.0
 psycopg2-binary
 psutil==6.1.1
+mysql-connector-python==8.4.0
+pymssql==2.3.13
+pymongo==4.8.0

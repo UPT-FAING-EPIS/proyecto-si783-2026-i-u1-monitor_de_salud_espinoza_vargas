@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 """
-db_connection.py — Capa de conexión PostgreSQL para el Monitor de Salud.
-Soporta:
-  - Conexión al PostgreSQL principal del monitor (via DATABASE_URL o config.ini)
-  - Conexiones dinámicas a cualquier datasource registrado (PG o MySQL opcional)
+db_connection.py — Capa de conexión para el Monitor de Salud.
+Soporta: PostgreSQL, MySQL, MariaDB, SQL Server, MongoDB.
 """
 
 import os
@@ -25,6 +23,22 @@ try:
 except ImportError:
     mysql = None
     _MYSQL_OK = False
+
+# ── SQL Server (opcional) ─────────────────────────────────────────────────────
+try:
+    import pymssql
+    _MSSQL_OK = True
+except ImportError:
+    pymssql = None
+    _MSSQL_OK = False
+
+# ── MongoDB (opcional) ───────────────────────────────────────────────────────
+try:
+    import pymongo
+    _MONGO_OK = True
+except ImportError:
+    pymongo = None
+    _MONGO_OK = False
 
 log = logging.getLogger(__name__)
 CONFIG_FILE = Path(__file__).parent / "config.ini"
@@ -110,7 +124,7 @@ def connect_to_datasource(ds: dict, timeout: int = 10):
             connect_timeout=timeout,
         )
 
-    if tipo == "mysql":
+    if tipo in ("mysql", "mariadb"):
         if not _MYSQL_OK:
             raise RuntimeError("Driver MySQL no instalado. Añade mysql-connector-python a requirements.txt.")
         return mysql.connector.connect(
@@ -122,6 +136,35 @@ def connect_to_datasource(ds: dict, timeout: int = 10):
             connection_timeout=timeout,
         )
 
+    if tipo in ("sqlserver", "mssql"):
+        if not _MSSQL_OK:
+            raise RuntimeError("Driver SQL Server no instalado. Añade pymssql a requirements.txt.")
+        return pymssql.connect(
+            server=ds["host"],
+            port=int(ds["puerto"]),
+            user=ds["usuario"],
+            password=ds["password"],
+            database=ds["database"],
+            timeout=timeout,
+            login_timeout=timeout,
+        )
+
+    if tipo == "mongodb":
+        if not _MONGO_OK:
+            raise RuntimeError("Driver MongoDB no instalado. Añade pymongo a requirements.txt.")
+        # Devuelve MongoClient — NO es DB-API; usar solo en collect_mongodb_metrics
+        uri_auth = ""
+        if ds.get("usuario"):
+            from urllib.parse import quote_plus as _qp
+            uri_auth = f"{_qp(ds['usuario'])}:{_qp(ds['password'])}@"
+        uri = f"mongodb://{uri_auth}{ds['host']}:{ds['puerto']}/{ds['database']}"
+        return pymongo.MongoClient(
+            uri,
+            serverSelectionTimeoutMS=timeout * 1000,
+            connectTimeoutMS=timeout * 1000,
+            socketTimeoutMS=timeout * 1000,
+        )
+
     raise ValueError(f"tipo_db no soportado: {tipo}")
 
 
@@ -130,13 +173,20 @@ def test_datasource(ds: dict) -> tuple[bool, float | None, str | None]:
     Prueba la conexión a un datasource.
     Retorna (ok: bool, latencia_ms: float|None, error: str|None)
     """
+    tipo = (ds.get("tipo_db") or "postgresql").lower()
     t0 = time.perf_counter()
     try:
-        conn = connect_to_datasource(ds, timeout=5)
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.close()
-        conn.close()
+        if tipo == "mongodb":
+            client = connect_to_datasource(ds, timeout=5)
+            client.admin.command("ping")
+            client.close()
+        else:
+            conn = connect_to_datasource(ds, timeout=5)
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.fetchall()  # requerido por mysql-connector para liberar el resultado
+            cur.close()
+            conn.close()
         ms = round((time.perf_counter() - t0) * 1000, 1)
         return True, ms, None
     except Exception as exc:

@@ -1,0 +1,187 @@
+===========================================================
+  GUIÓN DE EXPOSICIÓN — MONITOR DE SALUD DE BASE DE DATOS
+  Curso: SI783 | 2026-I | Alumno: Espinoza Vargas, Gerardo
+===========================================================
+
+-----------------------------------------------------------
+1. ¿QUÉ ES EL PROYECTO?
+-----------------------------------------------------------
+
+"Buenos días/tardes, profesor. Mi proyecto se llama
+'DB Health Monitor', que en español significa
+Monitor de Salud de Base de Datos.
+
+Es una aplicación web que permite ver, desde cualquier
+navegador, cómo se encuentra el estado de una base de
+datos en tiempo real. Muestra información como cuánta
+memoria está usando el servidor, qué tan cargado está
+el procesador, cuántas personas están conectadas a la
+base de datos, y si existe algún problema o alerta."
+
+-----------------------------------------------------------
+2. ¿PARA QUÉ SIRVE?
+-----------------------------------------------------------
+
+"Sirve para que el administrador de un sistema pueda
+estar al tanto del funcionamiento de sus bases de datos
+sin tener que revisar el servidor manualmente.
+
+Si algo empieza a fallar, por ejemplo si el servidor
+está usando demasiada memoria o si hay muchas conexiones
+activas, el sistema lo detecta automáticamente y cambia
+su estado a ADVERTENCIA o CRÍTICO, para que el
+administrador actúe a tiempo."
+
+-----------------------------------------------------------
+3. ¿DÓNDE ESTÁ INSTALADO?
+-----------------------------------------------------------
+
+"La aplicación está instalada en un servidor virtual
+con sistema operativo Debian 12, que es un sistema
+Linux. En ese mismo servidor también está la base de
+datos PostgreSQL que el monitor vigila.
+
+Cada vez que subo un cambio al repositorio de GitHub,
+el sistema se actualiza automáticamente en el servidor
+gracias a un proceso llamado GitHub Actions, sin
+necesidad de hacerlo de forma manual."
+
+-----------------------------------------------------------
+4. RECORRIDO POR LA INTERFAZ — PESTAÑA "DASHBOARD"
+-----------------------------------------------------------
+
+"Ahora voy a mostrar la aplicación. Al entrar, lo primero
+que se ve es la pestaña principal llamada Dashboard.
+
+En la parte superior hay una barra de navegación con
+tres pestañas: Dashboard, Fuentes de Datos e Importar SQL.
+También aparece un indicador de estado en la esquina
+superior derecha que dice 'OK', 'WARNING' o 'CRITICAL'
+según cómo esté el sistema en ese momento.
+
+Debajo hay un selector que dice 'Fuente', que sirve para
+elegir qué base de datos se quiere visualizar. Si se deja
+en 'Vista Global', muestra un resumen de todas las bases
+de datos registradas al mismo tiempo.
+
+---
+
+Luego aparecen seis tarjetas de métricas principales,
+llamadas KPIs. Cada una muestra un dato importante:
+
+  - CONEXIONES: Muestra cuántas conexiones están abiertas
+    en este momento sobre el total máximo permitido, y
+    qué porcentaje de uso representa. Tiene una barra de
+    progreso que se llena según el uso.
+
+  - CACHE HIT RATIO: Indica qué porcentaje de las
+    consultas a la base de datos se están respondiendo
+    desde la memoria interna, sin ir al disco. Mientras
+    más alto el porcentaje, mejor funciona la base de
+    datos.
+
+  - CPU HOST: Muestra en porcentaje qué tan ocupado está
+    el procesador del servidor en ese instante.
+
+  - MEMORIA HOST: Muestra qué porcentaje de la memoria
+    RAM del servidor está siendo utilizada.
+
+  - TAMAÑO BD: Indica cuántos megabytes está ocupando
+    la base de datos en el disco del servidor.
+
+  - ESTADO GENERAL: Muestra si el sistema está en estado
+    OK, WARNING o CRITICAL, y también cuántos procesos
+    están activos y cuántos están esperando.
+
+---
+
+Más abajo hay tres gráficos de línea que muestran el
+historial de las métricas a lo largo del tiempo:
+
+  - El primero muestra cómo han variado las conexiones
+    activas en los últimos minutos.
+
+  - El segundo muestra el historial del Cache Hit Ratio.
+
+  - El tercero muestra juntos el uso de CPU y de memoria
+    RAM para compararlos fácilmente.
+
+Todos los gráficos se actualizan automáticamente cada
+30 segundos sin necesidad de recargar la página.
+
+---
+
+Al final del Dashboard hay una tabla con el resumen
+general de todas las fuentes de datos registradas.
+Muestra el nombre de la fuente, su tipo, el host,
+cuántas conexiones tiene y cuál es su estado."
+
+-----------------------------------------------------------
+5. RECORRIDO POR LA INTERFAZ — PESTAÑA "FUENTES DE DATOS"
+-----------------------------------------------------------
+
+"En la segunda pestaña, 'Fuentes de Datos', se pueden
+administrar las bases de datos que el monitor debe
+vigilar.
+
+Aparece una tabla con todas las fuentes registradas,
+mostrando su nombre, tipo (PostgreSQL o MySQL), la
+dirección del servidor, el nombre de la base de datos
+y su estado actual.
+
+Cada fila tiene tres botones de acción:
+
+  - El botón 'Test' sirve para verificar si la conexión
+    con esa base de datos está funcionando. Al presionarlo
+    aparece un mensaje indicando si se conectó
+    correctamente y en cuántos milisegundos lo hizo.
+
+  - El botón 'Editar' permite modificar los datos de esa
+    fuente, por ejemplo cambiar el usuario o la contraseña.
+
+  - El botón de eliminar borra la fuente del sistema.
+
+También hay un botón '+ Nueva Fuente' que abre un
+formulario donde se ingresan los datos de una nueva base
+de datos para empezar a monitorearla. El formulario pide:
+nombre, tipo de base de datos, host, puerto, usuario,
+contraseña y nombre de la base de datos. Además tiene
+un botón para probar la conexión antes de guardar."
+
+-----------------------------------------------------------
+6. RECORRIDO POR LA INTERFAZ — PESTAÑA "IMPORTAR SQL"
+-----------------------------------------------------------
+
+"En la tercera pestaña, 'Importar SQL', se puede subir
+un archivo con instrucciones SQL para ejecutarlas
+directamente sobre una de las bases de datos registradas.
+
+Primero se selecciona la fuente de destino, luego se
+elige el archivo SQL arrastrándolo o haciendo clic en
+la zona de carga. El botón 'Ejecutar importación' se
+activa automáticamente cuando ambos campos están
+completos.
+
+Después de ejecutar, aparece un resumen con cuántas
+instrucciones se ejecutaron correctamente, cuántas
+fallaron y cuál fue el error en caso de haberlo.
+
+Debajo hay una tabla con el historial de todas las
+importaciones realizadas, mostrando la fecha, la fuente,
+el nombre del archivo, el estado y la cantidad de
+instrucciones exitosas y fallidas."
+
+-----------------------------------------------------------
+7. CIERRE
+-----------------------------------------------------------
+
+"En resumen, el proyecto es una herramienta completa
+para monitorear bases de datos en tiempo real, gestionar
+múltiples fuentes de datos y ejecutar scripts SQL, todo
+desde el navegador web. Está desplegado en un servidor
+Debian 12 y se actualiza de forma automática mediante
+GitHub Actions. Estoy abierto a cualquier pregunta."
+
+===========================================================
+FIN DEL GUIÓN
+===========================================================

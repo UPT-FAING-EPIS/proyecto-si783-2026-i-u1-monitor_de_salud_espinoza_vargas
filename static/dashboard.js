@@ -282,6 +282,24 @@ async function deleteDs(id, nombre) {
   loadDatasourcesTable();
 }
 
+const DEFAULT_PORTS = {
+  postgresql: '5432',
+  mysql:      '3306',
+  mariadb:    '3306',
+  sqlserver:  '1433',
+  mongodb:    '27017',
+};
+
+function onTipoChange() {
+  const tipo   = document.getElementById('ds-tipo').value;
+  const puerto = document.getElementById('ds-puerto');
+  // Solo sobreescribe si el campo está vacío o tiene un puerto por defecto conocido
+  const defaults = Object.values(DEFAULT_PORTS);
+  if (!puerto.value || defaults.includes(puerto.value)) {
+    puerto.value = DEFAULT_PORTS[tipo] || '5432';
+  }
+}
+
 function openDsModal(ds = null) {
   document.getElementById('modal-title').textContent = ds ? 'Editar Fuente' : 'Nueva Fuente de Datos';
   document.getElementById('modal-ds-id').value   = ds ? ds.id : '';

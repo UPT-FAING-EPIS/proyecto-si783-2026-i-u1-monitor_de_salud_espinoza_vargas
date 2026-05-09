@@ -210,6 +210,255 @@ def collect_pg_metrics(ds: dict) -> dict:
         "status":           status,
     }
 
+
+def collect_mysql_metrics(ds: dict) -> dict:
+    conn = connect_to_datasource(ds, timeout=8)
+    cur  = conn.cursor()
+
+    # Variables globales de estado
+    cur.execute("SHOW GLOBAL STATUS")
+    status_vars = {row[0]: row[1] for row in cur.fetchall()}
+
+    # max_connections
+    cur.execute("SHOW GLOBAL VARIABLES LIKE 'max_connections'")
+    max_conn = int((cur.fetchone() or [None, 100])[1])
+
+    threads_connected = int(status_vars.get("Threads_connected", 0))
+    threads_running   = int(status_vars.get("Threads_running",   0))
+    slow_queries      = int(status_vars.get("Slow_queries",       0))
+
+    # Procesos en espera
+    cur.execute("""
+        SELECT COUNT(*) FROM information_schema.processlist
+        WHERE command != 'Sleep'
+    """)
+    threads_waiting = int((cur.fetchone() or [0])[0])
+
+    # InnoDB cache hit ratio
+    pool_reads    = int(status_vars.get("Innodb_buffer_pool_reads",         0))
+    pool_requests = int(status_vars.get("Innodb_buffer_pool_read_requests", 1))
+    if pool_requests > 0:
+        cache_hit = round((1 - pool_reads / pool_requests) * 100, 2)
+    else:
+        cache_hit = 99.9
+    cache_hit = max(0.0, min(100.0, cache_hit))
+
+    # Tamaño de la base de datos en MB
+    cur.execute("""
+        SELECT COALESCE(SUM(data_length + index_length), 0) / 1024 / 1024
+        FROM information_schema.tables
+        WHERE table_schema = DATABASE()
+    """)
+    db_mb = round(float((cur.fetchone() or [0])[0]), 2)
+
+    cur.close(); conn.close()
+
+    conn_pct = round(min(99.9, threads_connected / max_conn * 100), 2) if max_conn else 0
+
+    # psutil
+    cpu_pct = mem_pct = 0.0
+    try:
+        if _PSUTIL:
+            cpu_pct = psutil.cpu_percent(interval=None)
+            mem_pct = psutil.virtual_memory().percent
+    except Exception: pass
+
+    status = "OK"
+    if conn_pct >= 90 or cache_hit < 70: status = "CRITICAL"
+    elif conn_pct >= 70 or cache_hit < 85: status = "WARNING"
+
+    return {
+        "datasource_id":    ds["id"],
+        "tipo_db":          "mysql",
+        "timestamp":        datetime.now().isoformat(),
+        "max_connections":  max_conn,
+        "threads_connected":threads_connected,
+        "threads_running":  threads_running,
+        "threads_waiting":  threads_waiting,
+        "connection_pct":   conn_pct,
+        "qps":              0.0,
+        "slow_queries":     slow_queries,
+        "cache_hit_ratio":  cache_hit,
+        "db_size_mb":       db_mb,
+        "cpu_pct":          cpu_pct,
+        "mem_pct":          mem_pct,
+        "status":           status,
+    }
+
+
+def collect_mariadb_metrics(ds: dict) -> dict:
+    """MariaDB es compatible con MySQL — reutiliza la misma función."""
+    m = collect_mysql_metrics(ds)
+    m["tipo_db"] = "mariadb"
+    return m
+
+
+def collect_sqlserver_metrics(ds: dict) -> dict:
+    conn = connect_to_datasource(ds, timeout=8)
+    cur  = conn.cursor()
+
+    # Max connections
+    cur.execute("SELECT value_in_use FROM sys.configurations WHERE name = 'max connections'")
+    max_conn_val = int((cur.fetchone() or [0])[0])
+    max_conn = max_conn_val if max_conn_val > 0 else 32767
+
+    # Conexiones activas y en espera
+    cur.execute("""
+        SELECT
+            COUNT(*),
+            SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END),
+            SUM(CASE WHEN wait_type IS NOT NULL THEN 1 ELSE 0 END)
+        FROM sys.dm_exec_sessions
+        WHERE is_user_process = 1
+    """)
+    row = cur.fetchone() or (0, 0, 0)
+    threads_connected = int(row[0] or 0)
+    threads_running   = int(row[1] or 0)
+    threads_waiting   = int(row[2] or 0)
+
+    # Cache hit ratio (Buffer Manager)
+    cur.execute("""
+        SELECT
+            MAX(CASE WHEN counter_name = 'Buffer cache hit ratio'
+                     THEN CAST(cntr_value AS FLOAT) END),
+            MAX(CASE WHEN counter_name = 'Buffer cache hit ratio base'
+                     THEN CAST(cntr_value AS FLOAT) END)
+        FROM sys.dm_os_performance_counters
+        WHERE counter_name IN ('Buffer cache hit ratio', 'Buffer cache hit ratio base')
+          AND object_name LIKE '%Buffer Manager%'
+    """)
+    row = cur.fetchone() or (0, 1)
+    hit, base = (float(row[0] or 0)), (float(row[1] or 1))
+    cache_hit = round((hit / base) * 100, 2) if base else 99.9
+    cache_hit = max(0.0, min(100.0, cache_hit))
+
+    # Tamaño de la base de datos actual en MB
+    cur.execute("""
+        SELECT CAST(SUM(size) * 8.0 / 1024 AS FLOAT)
+        FROM sys.master_files
+        WHERE database_id = DB_ID()
+    """)
+    db_mb = round(float((cur.fetchone() or [0])[0] or 0), 2)
+
+    # Slow queries (queries con duración > 1s)
+    cur.execute("""
+        SELECT COUNT(*)
+        FROM sys.dm_exec_requests r
+        CROSS APPLY sys.dm_exec_sql_text(r.sql_handle)
+        WHERE r.total_elapsed_time > 1000
+    """)
+    slow_queries = int((cur.fetchone() or [0])[0])
+
+    cur.close(); conn.close()
+
+    conn_pct = round(min(99.9, threads_connected / max_conn * 100), 2) if max_conn else 0
+
+    cpu_pct = mem_pct = 0.0
+    try:
+        if _PSUTIL:
+            cpu_pct = psutil.cpu_percent(interval=None)
+            mem_pct = psutil.virtual_memory().percent
+    except Exception: pass
+
+    status = "OK"
+    if conn_pct >= 90 or cache_hit < 70: status = "CRITICAL"
+    elif conn_pct >= 70 or cache_hit < 85: status = "WARNING"
+
+    return {
+        "datasource_id":    ds["id"],
+        "tipo_db":          "sqlserver",
+        "timestamp":        datetime.now().isoformat(),
+        "max_connections":  max_conn,
+        "threads_connected":threads_connected,
+        "threads_running":  threads_running,
+        "threads_waiting":  threads_waiting,
+        "connection_pct":   conn_pct,
+        "qps":              0.0,
+        "slow_queries":     slow_queries,
+        "cache_hit_ratio":  cache_hit,
+        "db_size_mb":       db_mb,
+        "cpu_pct":          cpu_pct,
+        "mem_pct":          mem_pct,
+        "status":           status,
+    }
+
+
+def collect_mongodb_metrics(ds: dict) -> dict:
+    from db_connection import _MONGO_OK
+    if not _MONGO_OK:
+        raise RuntimeError("Driver MongoDB no instalado. Añade pymongo a requirements.txt.")
+    import pymongo as _pymongo
+
+    uri_auth = ""
+    if ds.get("usuario"):
+        from urllib.parse import quote_plus as _qp
+        uri_auth = f"{_qp(ds['usuario'])}:{_qp(ds['password'])}@"
+    uri = f"mongodb://{uri_auth}{ds['host']}:{ds['puerto']}/{ds['database']}"
+    client = _pymongo.MongoClient(
+        uri,
+        serverSelectionTimeoutMS=8000,
+        connectTimeoutMS=8000,
+        socketTimeoutMS=8000,
+    )
+    try:
+        srv = client.admin.command("serverStatus")
+
+        conns       = srv.get("connections", {})
+        current     = int(conns.get("current",   0))
+        available   = int(conns.get("available", 1000))
+        max_conn    = current + available
+
+        # WiredTiger cache hit ratio
+        wt          = srv.get("wiredTiger", {}).get("cache", {})
+        reads_into  = int(wt.get("pages read into cache",        1))
+        reads_req   = int(wt.get("pages requested from the cache", 1))
+        cache_hit   = round((1 - reads_into / max(reads_req, 1)) * 100, 2)
+        cache_hit   = max(0.0, min(100.0, cache_hit))
+
+        # Tamaño de la BD
+        db_stats    = client[ds["database"]].command("dbStats")
+        db_mb       = round(db_stats.get("dataSize", 0) / 1024 / 1024, 2)
+
+        # Operaciones activas
+        cur_op      = client.admin.command("currentOp")
+        inprog      = cur_op.get("inprog", [])
+        running     = sum(1 for op in inprog if not op.get("waitingForLock", False))
+        waiting     = sum(1 for op in inprog if     op.get("waitingForLock", False))
+
+        conn_pct = round(min(99.9, current / max_conn * 100), 2) if max_conn else 0
+
+        cpu_pct = mem_pct = 0.0
+        try:
+            if _PSUTIL:
+                cpu_pct = psutil.cpu_percent(interval=None)
+                mem_pct = psutil.virtual_memory().percent
+        except Exception: pass
+
+        status = "OK"
+        if conn_pct >= 90 or cache_hit < 70: status = "CRITICAL"
+        elif conn_pct >= 70 or cache_hit < 85: status = "WARNING"
+
+        return {
+            "datasource_id":    ds["id"],
+            "tipo_db":          "mongodb",
+            "timestamp":        datetime.now().isoformat(),
+            "max_connections":  max_conn,
+            "threads_connected":current,
+            "threads_running":  running,
+            "threads_waiting":  waiting,
+            "connection_pct":   conn_pct,
+            "qps":              0.0,
+            "slow_queries":     0,
+            "cache_hit_ratio":  cache_hit,
+            "db_size_mb":       db_mb,
+            "cpu_pct":          cpu_pct,
+            "mem_pct":          mem_pct,
+            "status":           status,
+        }
+    finally:
+        client.close()
+
+
 def save_snapshot(m: dict):
     conn = get_monitor_conn()
     try:
@@ -294,6 +543,14 @@ def background_collector():
                     tipo = (ds.get("tipo_db") or "postgresql").lower()
                     if tipo == "postgresql":
                         m = collect_pg_metrics(ds)
+                    elif tipo == "mysql":
+                        m = collect_mysql_metrics(ds)
+                    elif tipo == "mariadb":
+                        m = collect_mariadb_metrics(ds)
+                    elif tipo in ("sqlserver", "mssql"):
+                        m = collect_sqlserver_metrics(ds)
+                    elif tipo == "mongodb":
+                        m = collect_mongodb_metrics(ds)
                     else:
                         raise NotImplementedError(f"Tipo '{tipo}' no soportado aún.")
                     with _cache_lock:
@@ -314,7 +571,7 @@ def background_collector():
         except Exception as e:
             log.error("background_collector: %s", e)
 
-        interval = cfg_int("monitor", "refresh_interval", 30)
+        interval = cfg_int("monitor", "refresh_interval", 10)
         time.sleep(interval)
 
 # ── SQL Import helpers ────────────────────────────────────────────────────────

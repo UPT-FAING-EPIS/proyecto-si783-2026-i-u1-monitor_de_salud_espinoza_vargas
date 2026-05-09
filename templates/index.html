@@ -205,9 +205,12 @@
         </div>
         <div class="form-group">
           <label>Tipo *</label>
-          <select id="ds-tipo" class="form-input">
+          <select id="ds-tipo" class="form-input" onchange="onTipoChange()">
             <option value="postgresql">PostgreSQL</option>
             <option value="mysql">MySQL</option>
+            <option value="mariadb">MariaDB</option>
+            <option value="sqlserver">SQL Server (MSSQL)</option>
+            <option value="mongodb">MongoDB</option>
           </select>
         </div>
       </div>
