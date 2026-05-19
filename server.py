@@ -13,8 +13,9 @@ except Exception:
     psutil = None; _proc = None; _PSUTIL = False
 
 import psycopg2, psycopg2.extras
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, session
 from flask_cors import CORS
+from werkzeug.security import check_password_hash, generate_password_hash
 from db_connection import (
     get_monitor_conn, release_conn, build_dsn,
     connect_to_datasource, test_datasource, load_config
@@ -25,11 +26,59 @@ log = logging.getLogger("monitor")
 
 app = Flask(__name__, static_folder="static", template_folder="templates")
 CORS(app)
+app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.jinja_env.auto_reload = True
 
 BASE_DIR = Path(__file__).parent
 _initialized = threading.Event()
 _cache: dict = {}          # {ds_id: {"metrics": ..., "error": ..., "ts": ...}}
 _cache_lock = threading.Lock()
+
+AUTH_PUBLIC_PATHS = {
+    "/",
+    "/api/health",
+    "/api/config",
+    "/api/login",
+    "/api/register",
+    "/api/me",
+    "/api/logout",
+    "/static/style.css",
+    "/static/dashboard.js",
+}
+
+FILE_PROFILE_DEFS = {
+    "postgresql": [
+        {"key": "config", "label": "Configuración", "description": "postgresql.conf, pg_hba.conf", "paths": ["{config_dir}/postgresql.conf", "{config_dir}/pg_hba.conf", "{config_dir}/pg_ident.conf"]},
+        {"key": "data", "label": "Datos", "description": "Directorio de datos y WAL", "paths": ["{data_dir}", "{data_dir}/pg_wal"]},
+        {"key": "log", "label": "Logs", "description": "Registros del servidor", "paths": ["{log_dir}"]},
+        {"key": "backup", "label": "Respaldo", "description": "Directorio de backups", "paths": ["{backup_dir}"]},
+    ],
+    "mysql": [
+        {"key": "config", "label": "Configuración", "description": "my.cnf / mysqld.cnf", "paths": ["{config_dir}/my.cnf", "{config_dir}/mysql.conf.d/mysqld.cnf"]},
+        {"key": "data", "label": "Datos", "description": "Directorio de datos", "paths": ["{data_dir}"]},
+        {"key": "log", "label": "Logs", "description": "Error log y logs del motor", "paths": ["{log_dir}"]},
+        {"key": "backup", "label": "Respaldo", "description": "Directorio de backups", "paths": ["{backup_dir}"]},
+    ],
+    "mariadb": [
+        {"key": "config", "label": "Configuración", "description": "50-server.cnf / my.cnf", "paths": ["{config_dir}/my.cnf", "{config_dir}/mariadb.conf.d/50-server.cnf"]},
+        {"key": "data", "label": "Datos", "description": "Directorio de datos", "paths": ["{data_dir}"]},
+        {"key": "log", "label": "Logs", "description": "Registro de errores", "paths": ["{log_dir}"]},
+        {"key": "backup", "label": "Respaldo", "description": "Directorio de backups", "paths": ["{backup_dir}"]},
+    ],
+    "sqlserver": [
+        {"key": "config", "label": "Configuración", "description": "Archivos de instancia y configuración", "paths": ["{config_dir}"]},
+        {"key": "data", "label": "Datos", "description": "Archivos MDF/NDF", "paths": ["{data_dir}"]},
+        {"key": "log", "label": "Logs", "description": "Log de error y trazas", "paths": ["{log_dir}"]},
+        {"key": "backup", "label": "Respaldo", "description": "Backups", "paths": ["{backup_dir}"]},
+    ],
+    "mongodb": [
+        {"key": "config", "label": "Configuración", "description": "mongod.conf", "paths": ["{config_dir}/mongod.conf"]},
+        {"key": "data", "label": "Datos", "description": "dbPath", "paths": ["{data_dir}"]},
+        {"key": "log", "label": "Logs", "description": "Log de MongoDB", "paths": ["{log_dir}"]},
+        {"key": "backup", "label": "Respaldo", "description": "Backups", "paths": ["{backup_dir}"]},
+    ],
+}
 
 # ── Config helpers ────────────────────────────────────────────────────────────
 
@@ -41,11 +90,204 @@ def cfg_bool(section, key, fallback=True):
     try: return load_config().getboolean(section, key, fallback=fallback)
     except: return fallback
 
+
+def bootstrap_admin_credentials() -> tuple[str, str]:
+    cfg = load_config()
+    user = os.environ.get("APP_BOOTSTRAP_USER", cfg.get("auth", "username", fallback="admin"))
+    password = os.environ.get("APP_BOOTSTRAP_PASSWORD", cfg.get("auth", "password", fallback="Admin2026!"))
+    return user, password
+
+
+def ensure_auth_ready() -> None:
+    if not _initialized.is_set():
+        init_db(retries=1, delay=0.0)
+
+
+def authenticate_user(username: str, password: str) -> dict | None:
+    ensure_auth_ready()
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            """
+            SELECT id, username, password_hash, role, active
+            FROM auth_users
+            WHERE username = %s
+            """,
+            (username,),
+        )
+        row = cur.fetchone()
+        cur.close()
+        if not row or not row.get("active"):
+            return None
+        if not check_password_hash(row["password_hash"], password):
+            return None
+        return dict(row)
+    finally:
+        release_conn(conn)
+
+
+def seed_default_user(conn) -> None:
+    username, password = bootstrap_admin_credentials()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO auth_users (username, password_hash, role, active)
+        VALUES (%s, %s, %s, TRUE)
+        ON CONFLICT (username) DO NOTHING
+        """,
+        (username, generate_password_hash(password), "admin"),
+    )
+    cur.execute(
+        """
+        INSERT INTO auth_users (username, password_hash, role, active)
+        VALUES (%s, %s, %s, TRUE)
+        ON CONFLICT (username) DO NOTHING
+        """,
+        ("ariana", generate_password_hash("123456"), "viewer"),
+    )
+    conn.commit()
+    cur.close()
+
+
+def current_username() -> str | None:
+    return session.get("user")
+
+
+def current_role() -> str:
+    return str(session.get("role", "viewer"))
+
+
+def is_admin() -> bool:
+    return current_role() == "admin"
+
+
+def is_logged_in() -> bool:
+    return bool(session.get("user"))
+
+
+@app.before_request
+def require_login():
+    if request.path in AUTH_PUBLIC_PATHS:
+        return None
+    if request.path.startswith("/static/"):
+        return None
+    if request.path.startswith("/api/") and not is_logged_in():
+        return {"error": "No autenticado"}, 401
+    return None
+
+
+def _default_file_roots(ds: dict) -> dict:
+    tipo = (ds.get("tipo_db") or "postgresql").lower()
+    cfg = load_config()
+    if tipo == "postgresql":
+        return {
+            "config_dir": cfg.get("files", "postgresql_config_dir", fallback="/etc/postgresql/15/main"),
+            "data_dir": cfg.get("files", "postgresql_data_dir", fallback="/var/lib/postgresql/15/main"),
+            "log_dir": cfg.get("files", "postgresql_log_dir", fallback="/var/log/postgresql"),
+            "backup_dir": cfg.get("files", "postgresql_backup_dir", fallback="/var/backups/postgresql"),
+        }
+    if tipo in ("mysql", "mariadb"):
+        return {
+            "config_dir": cfg.get("files", "mysql_config_dir", fallback="/etc/mysql"),
+            "data_dir": cfg.get("files", "mysql_data_dir", fallback="/var/lib/mysql"),
+            "log_dir": cfg.get("files", "mysql_log_dir", fallback="/var/log/mysql"),
+            "backup_dir": cfg.get("files", "mysql_backup_dir", fallback="/var/backups/mysql"),
+        }
+    if tipo in ("sqlserver", "mssql"):
+        return {
+            "config_dir": cfg.get("files", "sqlserver_config_dir", fallback="C:/Program Files/Microsoft SQL Server"),
+            "data_dir": cfg.get("files", "sqlserver_data_dir", fallback="C:/Program Files/Microsoft SQL Server/MSSQL/Data"),
+            "log_dir": cfg.get("files", "sqlserver_log_dir", fallback="C:/Program Files/Microsoft SQL Server/MSSQL/Log"),
+            "backup_dir": cfg.get("files", "sqlserver_backup_dir", fallback="C:/Backups/SQLServer"),
+        }
+    if tipo == "mongodb":
+        return {
+            "config_dir": cfg.get("files", "mongodb_config_dir", fallback="/etc"),
+            "data_dir": cfg.get("files", "mongodb_data_dir", fallback="/var/lib/mongodb"),
+            "log_dir": cfg.get("files", "mongodb_log_dir", fallback="/var/log/mongodb"),
+            "backup_dir": cfg.get("files", "mongodb_backup_dir", fallback="/var/backups/mongodb"),
+        }
+    return {"config_dir": ".", "data_dir": ".", "log_dir": ".", "backup_dir": "."}
+
+
+def _safe_stat_path(path: str) -> dict:
+    try:
+        p = Path(path)
+        if not p.exists():
+            return {"exists": False, "kind": "missing", "size_mb": 0.0, "modified_at": None, "entries": 0}
+        if p.is_file():
+            st = p.stat()
+            return {
+                "exists": True,
+                "kind": "file",
+                "size_mb": round(st.st_size / 1024 / 1024, 3),
+                "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+                "entries": 1,
+            }
+        total_size = 0
+        count = 0
+        for child in p.rglob("*"):
+            try:
+                if child.is_file():
+                    total_size += child.stat().st_size
+                    count += 1
+            except Exception:
+                continue
+        st = p.stat()
+        return {
+            "exists": True,
+            "kind": "directory",
+            "size_mb": round(total_size / 1024 / 1024, 3),
+            "modified_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
+            "entries": count,
+        }
+    except Exception as exc:
+        return {"exists": False, "kind": "error", "error": str(exc), "size_mb": 0.0, "modified_at": None, "entries": 0}
+
+
+def get_file_profile_defs(tipo_db: str) -> list[dict]:
+    return FILE_PROFILE_DEFS.get((tipo_db or "postgresql").lower(), FILE_PROFILE_DEFS["postgresql"])
+
+
+def build_file_inventory(ds: dict, selected_types: list[str] | None = None) -> list[dict]:
+    roots = _default_file_roots(ds)
+    profiles = get_file_profile_defs(ds.get("tipo_db"))
+    selected = {t.lower() for t in (selected_types or []) if t}
+    if selected:
+        profiles = [p for p in profiles if p["key"] in selected]
+
+    inventory = []
+    for profile in profiles:
+        for raw_path in profile.get("paths", []):
+            path = raw_path.format(**roots)
+            stat_info = _safe_stat_path(path)
+            inventory.append({
+                "datasource_id": ds.get("id"),
+                "datasource_name": ds.get("nombre"),
+                "tipo_db": ds.get("tipo_db"),
+                "file_type": profile["key"],
+                "label": profile["label"],
+                "description": profile["description"],
+                "path": path,
+                **stat_info,
+            })
+    return inventory
+
 # ── DB Init ───────────────────────────────────────────────────────────────────
 
 
 INIT_SQL = [
     # 1. Tablas nuevas (si no existen)
+    """CREATE TABLE IF NOT EXISTS auth_users (
+        id            SERIAL PRIMARY KEY,
+        username      VARCHAR(100) NOT NULL UNIQUE,
+        password_hash VARCHAR(255) NOT NULL,
+        role          VARCHAR(30)  NOT NULL DEFAULT 'user',
+        active        BOOLEAN      NOT NULL DEFAULT TRUE,
+        created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        last_login    TIMESTAMPTZ
+    )""",
     """CREATE TABLE IF NOT EXISTS datasources (
         id         SERIAL PRIMARY KEY,
         nombre     VARCHAR(100) NOT NULL,
@@ -56,6 +298,7 @@ INIT_SQL = [
         password   TEXT         NOT NULL DEFAULT '',
         database   VARCHAR(100) NOT NULL,
         activa     BOOLEAN      NOT NULL DEFAULT TRUE,
+        owner_username VARCHAR(100) NOT NULL DEFAULT 'hashira',
         created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
     )""",
     """CREATE TABLE IF NOT EXISTS health_snapshots (
@@ -103,7 +346,13 @@ INIT_SQL = [
     "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS qps REAL NOT NULL DEFAULT 0",
     "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS slow_queries INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE alert_log ADD COLUMN IF NOT EXISTS datasource_id INTEGER",
+    "ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS role VARCHAR(30) NOT NULL DEFAULT 'user'",
+    "ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS active BOOLEAN NOT NULL DEFAULT TRUE",
+    "ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
+    "ALTER TABLE auth_users ADD COLUMN IF NOT EXISTS last_login TIMESTAMPTZ",
+    "ALTER TABLE datasources ADD COLUMN IF NOT EXISTS owner_username VARCHAR(100) NOT NULL DEFAULT 'hashira'",
     # 3. Índices
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_username ON auth_users (username)",
     "CREATE INDEX IF NOT EXISTS idx_snap_ds  ON health_snapshots (datasource_id, captured_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_alert_ds ON alert_log        (datasource_id, alerted_at  DESC)",
     "CREATE INDEX IF NOT EXISTS idx_imp_ds   ON sql_imports      (datasource_id, uploaded_at DESC)",
@@ -123,12 +372,14 @@ def init_db(retries=10, delay=6.0):
                     log.warning("init_db stmt skip: %s", str(e)[:120])
                     conn.rollback()
             # Seed datasource principal si no hay ninguno
+            seed_default_user(conn)
+            bootstrap_owner = bootstrap_admin_credentials()[0]
             cur.execute("SELECT COUNT(*) FROM datasources")
             if cur.fetchone()[0] == 0:
                 cfg = load_config()
                 cur.execute("""
-                    INSERT INTO datasources (nombre, tipo_db, host, puerto, usuario, password, database)
-                    VALUES (%s,'postgresql',%s,%s,%s,%s,%s)
+                    INSERT INTO datasources (nombre, tipo_db, host, puerto, usuario, password, database, owner_username)
+                    VALUES (%s,'postgresql',%s,%s,%s,%s,%s,%s)
                 """, (
                     "Monitor Principal (VM)",
                     cfg.get("postgresql","host",fallback="38.250.116.71"),
@@ -136,8 +387,11 @@ def init_db(retries=10, delay=6.0):
                     cfg.get("postgresql","user",fallback="monitor"),
                     cfg.get("postgresql","password",fallback=""),
                     cfg.get("postgresql","database",fallback="db_health_monitor"),
+                    bootstrap_owner,
                 ))
                 conn.commit()
+            cur.execute("UPDATE datasources SET owner_username = %s WHERE owner_username IS NULL OR owner_username = ''", (bootstrap_owner,))
+            conn.commit()
             cur.close()
             release_conn(conn)
             log.info("Base de datos inicializada OK.")
@@ -175,17 +429,26 @@ def collect_pg_metrics(ds: dict) -> dict:
     cur.execute("SELECT count(*) FROM pg_stat_activity WHERE wait_event_type IS NOT NULL AND pid<>pg_backend_pid()")
     waiting = (cur.fetchone() or [0])[0]
 
+    cur.execute("SELECT EXTRACT(EPOCH FROM (now() - pg_postmaster_start_time()))::bigint")
+    uptime_seconds = int((cur.fetchone() or [0])[0] or 0)
+
     cur.close(); conn.close()
 
     db_mb   = round((db_size_bytes or 0)/1024/1024, 2)
     conn_pct= round(min(99.9, num_backends/max_conn*100), 2) if max_conn else 0
 
     # psutil
-    cpu_pct = mem_pct = 0.0
+    cpu_pct = mem_pct = disk_used_pct = 0.0
+    disk_free_gb = 0.0
+    host_processes = 0
     try:
         if _PSUTIL:
             cpu_pct = psutil.cpu_percent(interval=None)
             mem_pct = psutil.virtual_memory().percent
+            disk = psutil.disk_usage(str(BASE_DIR))
+            disk_used_pct = disk.percent
+            disk_free_gb = round(disk.free / 1024 / 1024 / 1024, 2)
+            host_processes = len(psutil.pids())
     except Exception: pass
 
     status = "OK"
@@ -207,6 +470,10 @@ def collect_pg_metrics(ds: dict) -> dict:
         "db_size_mb":       db_mb,
         "cpu_pct":          cpu_pct,
         "mem_pct":          mem_pct,
+        "disk_used_pct":    disk_used_pct,
+        "disk_free_gb":     disk_free_gb,
+        "host_processes":   host_processes,
+        "uptime_seconds":   uptime_seconds,
         "status":           status,
     }
 
@@ -226,6 +493,7 @@ def collect_mysql_metrics(ds: dict) -> dict:
     threads_connected = int(status_vars.get("Threads_connected", 0))
     threads_running   = int(status_vars.get("Threads_running",   0))
     slow_queries      = int(status_vars.get("Slow_queries",       0))
+    uptime_seconds    = int(status_vars.get("Uptime", 0))
 
     # Procesos en espera
     cur.execute("""
@@ -256,11 +524,17 @@ def collect_mysql_metrics(ds: dict) -> dict:
     conn_pct = round(min(99.9, threads_connected / max_conn * 100), 2) if max_conn else 0
 
     # psutil
-    cpu_pct = mem_pct = 0.0
+    cpu_pct = mem_pct = disk_used_pct = 0.0
+    disk_free_gb = 0.0
+    host_processes = 0
     try:
         if _PSUTIL:
             cpu_pct = psutil.cpu_percent(interval=None)
             mem_pct = psutil.virtual_memory().percent
+            disk = psutil.disk_usage(str(BASE_DIR))
+            disk_used_pct = disk.percent
+            disk_free_gb = round(disk.free / 1024 / 1024 / 1024, 2)
+            host_processes = len(psutil.pids())
     except Exception: pass
 
     status = "OK"
@@ -282,6 +556,10 @@ def collect_mysql_metrics(ds: dict) -> dict:
         "db_size_mb":       db_mb,
         "cpu_pct":          cpu_pct,
         "mem_pct":          mem_pct,
+        "disk_used_pct":    disk_used_pct,
+        "disk_free_gb":     disk_free_gb,
+        "host_processes":   host_processes,
+        "uptime_seconds":   uptime_seconds,
         "status":           status,
     }
 
@@ -349,15 +627,24 @@ def collect_sqlserver_metrics(ds: dict) -> dict:
     """)
     slow_queries = int((cur.fetchone() or [0])[0])
 
+    cur.execute("SELECT DATEDIFF(SECOND, sqlserver_start_time, SYSDATETIME()) FROM sys.dm_os_sys_info")
+    uptime_seconds = int((cur.fetchone() or [0])[0] or 0)
+
     cur.close(); conn.close()
 
     conn_pct = round(min(99.9, threads_connected / max_conn * 100), 2) if max_conn else 0
 
-    cpu_pct = mem_pct = 0.0
+    cpu_pct = mem_pct = disk_used_pct = 0.0
+    disk_free_gb = 0.0
+    host_processes = 0
     try:
         if _PSUTIL:
             cpu_pct = psutil.cpu_percent(interval=None)
             mem_pct = psutil.virtual_memory().percent
+            disk = psutil.disk_usage(str(BASE_DIR))
+            disk_used_pct = disk.percent
+            disk_free_gb = round(disk.free / 1024 / 1024 / 1024, 2)
+            host_processes = len(psutil.pids())
     except Exception: pass
 
     status = "OK"
@@ -379,6 +666,10 @@ def collect_sqlserver_metrics(ds: dict) -> dict:
         "db_size_mb":       db_mb,
         "cpu_pct":          cpu_pct,
         "mem_pct":          mem_pct,
+        "disk_used_pct":    disk_used_pct,
+        "disk_free_gb":     disk_free_gb,
+        "host_processes":   host_processes,
+        "uptime_seconds":   uptime_seconds,
         "status":           status,
     }
 
@@ -427,11 +718,17 @@ def collect_mongodb_metrics(ds: dict) -> dict:
 
         conn_pct = round(min(99.9, current / max_conn * 100), 2) if max_conn else 0
 
-        cpu_pct = mem_pct = 0.0
+        cpu_pct = mem_pct = disk_used_pct = 0.0
+        disk_free_gb = 0.0
+        host_processes = 0
         try:
             if _PSUTIL:
                 cpu_pct = psutil.cpu_percent(interval=None)
                 mem_pct = psutil.virtual_memory().percent
+            disk = psutil.disk_usage(str(BASE_DIR))
+            disk_used_pct = disk.percent
+            disk_free_gb = round(disk.free / 1024 / 1024 / 1024, 2)
+            host_processes = len(psutil.pids())
         except Exception: pass
 
         status = "OK"
@@ -453,6 +750,10 @@ def collect_mongodb_metrics(ds: dict) -> dict:
             "db_size_mb":       db_mb,
             "cpu_pct":          cpu_pct,
             "mem_pct":          mem_pct,
+            "disk_used_pct":    disk_used_pct,
+            "disk_free_gb":     disk_free_gb,
+            "host_processes":   host_processes,
+            "uptime_seconds":   int(srv.get("uptime", 0)),
             "status":           status,
         }
     finally:
@@ -587,13 +888,37 @@ def split_sql(text: str) -> list:
     return [s.strip() for s in text.split(";") if s.strip()]
 
 def get_ds_by_id(ds_id: int) -> dict | None:
+    username = current_username()
+    if not username:
+        return None
     conn = get_monitor_conn()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT * FROM datasources WHERE id=%s", (ds_id,))
+        if is_admin():
+            cur.execute("SELECT * FROM datasources WHERE id=%s", (ds_id,))
+        else:
+            cur.execute("SELECT * FROM datasources WHERE id=%s AND owner_username=%s", (ds_id, username))
         row = cur.fetchone()
         cur.close()
         return dict(row) if row else None
+    finally:
+        release_conn(conn)
+
+
+def get_owned_datasource_ids() -> set[int]:
+    username = current_username()
+    if not username:
+        return set()
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor()
+        if is_admin():
+            cur.execute("SELECT id FROM datasources")
+        else:
+            cur.execute("SELECT id FROM datasources WHERE owner_username=%s", (username,))
+        rows = {row[0] for row in cur.fetchall()}
+        cur.close()
+        return rows
     finally:
         release_conn(conn)
 
@@ -607,14 +932,149 @@ def api_health():
     started = _initialized.is_set()
     return {"status": "ok" if started else "starting"}, 200
 
+
+@app.route("/api/me")
+def api_me():
+    if not is_logged_in():
+        return {"authenticated": False}, 401
+    return {"authenticated": True, "user": session.get("user"), "role": session.get("role", "viewer")}
+
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    payload = request.get_json(silent=True) or request.form or {}
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    user = authenticate_user(username, password)
+    if not user:
+        return {"ok": False, "error": "Usuario o contraseña inválidos"}, 401
+
+    ensure_auth_ready()
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor()
+        cur.execute("UPDATE auth_users SET last_login = NOW() WHERE id = %s", (user["id"],))
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
+
+    session["user"] = user["username"]
+    session["role"] = user.get("role", "user")
+    return {"ok": True, "user": user["username"], "role": user.get("role", "user")}
+
+
+@app.route("/api/register", methods=["POST"])
+def api_register():
+    payload = request.get_json(silent=True) or request.form or {}
+    username = str(payload.get("username", "")).strip()
+    password = str(payload.get("password", ""))
+    confirm = str(payload.get("confirm_password", payload.get("confirm", "")))
+
+    if len(username) < 3:
+        return {"ok": False, "error": "El usuario debe tener al menos 3 caracteres"}, 400
+    if len(password) < 6:
+        return {"ok": False, "error": "La contraseña debe tener al menos 6 caracteres"}, 400
+    if password != confirm:
+        return {"ok": False, "error": "Las contraseñas no coinciden"}, 400
+
+    ensure_auth_ready()
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id FROM auth_users WHERE username = %s", (username,))
+        if cur.fetchone():
+            cur.close()
+            return {"ok": False, "error": "El usuario ya existe"}, 409
+
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO auth_users (username, password_hash, role, active)
+            VALUES (%s, %s, %s, TRUE)
+            RETURNING id
+            """,
+            (username, generate_password_hash(password), "user"),
+        )
+        new_id = cur.fetchone()[0]
+        conn.commit()
+        cur.close()
+        return {"ok": True, "id": new_id, "user": username}
+    finally:
+        release_conn(conn)
+
+
+@app.route("/api/logout", methods=["POST"])
+def api_logout():
+    session.clear()
+    return {"ok": True}
+
+
+@app.route("/api/file-types")
+def api_file_types():
+    ds_id = request.args.get("datasource_id", type=int)
+    if ds_id:
+        ds = get_ds_by_id(ds_id)
+        if not ds:
+            return {"error": "Datasource no encontrado"}, 404
+        defs = get_file_profile_defs(ds.get("tipo_db"))
+        return jsonify(defs)
+    return jsonify({k: v for k, v in FILE_PROFILE_DEFS.items()})
+
+
+@app.route("/api/files")
+def api_files():
+    ds_id = request.args.get("datasource_id", type=int)
+    if not ds_id:
+        return {"error": "datasource_id requerido"}, 400
+    ds = get_ds_by_id(ds_id)
+    if not ds:
+        return {"error": "Datasource no encontrado"}, 404
+    types_param = request.args.get("types", "")
+    selected_types = [t.strip() for t in types_param.split(",") if t.strip()]
+    files = build_file_inventory(ds, selected_types if selected_types else None)
+    return jsonify({
+        "datasource": {
+            "id": ds["id"],
+            "nombre": ds.get("nombre"),
+            "tipo_db": ds.get("tipo_db"),
+            "host": ds.get("host"),
+            "puerto": ds.get("puerto"),
+            "database": ds.get("database"),
+        },
+        "selected_types": selected_types,
+        "files": files,
+        "total": len(files),
+    })
+
 # ── Datasources CRUD ──────────────────────────────────────────────────────────
 
 @app.route("/api/datasources", methods=["GET"])
 def api_ds_list():
+    username = current_username()
+    if not username:
+        return jsonify([])
     conn = get_monitor_conn()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("SELECT id,nombre,tipo_db,host,puerto,usuario,database,activa,created_at FROM datasources ORDER BY id")
+        if is_admin():
+            cur.execute(
+                """
+                SELECT id,nombre,tipo_db,host,puerto,usuario,database,activa,created_at,owner_username
+                FROM datasources
+                ORDER BY id
+                """
+            )
+        else:
+            cur.execute(
+                """
+                SELECT id,nombre,tipo_db,host,puerto,usuario,database,activa,created_at,owner_username
+                FROM datasources
+                WHERE owner_username=%s
+                ORDER BY id
+                """,
+                (username,),
+            )
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         for r in rows:
@@ -632,6 +1092,9 @@ def api_ds_list():
 
 @app.route("/api/datasources", methods=["POST"])
 def api_ds_create():
+    username = current_username()
+    if not username:
+        return {"error": "No autenticado"}, 401
     d = request.json or {}
     required = ["nombre","tipo_db","host","puerto","usuario","database"]
     missing = [f for f in required if not d.get(f)]
@@ -641,19 +1104,47 @@ def api_ds_create():
     try:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO datasources (nombre,tipo_db,host,puerto,usuario,password,database,activa)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
+            INSERT INTO datasources (nombre,tipo_db,host,puerto,usuario,password,database,activa,owner_username)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id
         """, (d["nombre"], d["tipo_db"], d["host"], int(d["puerto"]),
               d["usuario"], d.get("password",""), d["database"],
-              d.get("activa", True)))
+              d.get("activa", True), username))
         new_id = cur.fetchone()[0]
         conn.commit(); cur.close()
         return {"id": new_id, "message": "Datasource creado."}, 201
     finally:
         release_conn(conn)
 
+
+@app.route("/api/admin/overview")
+def api_admin_overview():
+    if not is_admin():
+        return {"error": "No autorizado"}, 403
+    conn = get_monitor_conn()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT id, username, role, active, created_at, last_login FROM auth_users ORDER BY id")
+        users = [dict(row) for row in cur.fetchall()]
+        cur.execute("SELECT id, nombre, tipo_db, host, puerto, usuario, database, activa, owner_username, created_at FROM datasources ORDER BY id")
+        datasources = [dict(row) for row in cur.fetchall()]
+        cur.close()
+        for row in users + datasources:
+            for key in ("created_at", "last_login"):
+                value = row.get(key)
+                if hasattr(value, "isoformat"):
+                    row[key] = value.isoformat()
+        return jsonify({
+            "counts": {"users": len(users), "datasources": len(datasources)},
+            "users": users,
+            "datasources": datasources,
+        })
+    finally:
+        release_conn(conn)
+
 @app.route("/api/datasources/<int:ds_id>", methods=["PUT"])
 def api_ds_update(ds_id):
+    if not get_ds_by_id(ds_id):
+        return {"error": "No encontrado."}, 404
     d = request.json or {}
     conn = get_monitor_conn()
     try:
@@ -676,6 +1167,8 @@ def api_ds_update(ds_id):
 
 @app.route("/api/datasources/<int:ds_id>", methods=["DELETE"])
 def api_ds_delete(ds_id):
+    if not get_ds_by_id(ds_id):
+        return {"error": "No encontrado."}, 404
     conn = get_monitor_conn()
     try:
         cur = conn.cursor()
@@ -704,21 +1197,27 @@ def api_metrics():
     ds_id = request.args.get("datasource_id", type=int)
     with _cache_lock:
         snap = dict(_cache)
+    owned_ids = get_owned_datasource_ids()
     if ds_id:
+        if ds_id not in owned_ids:
+            return {"error": "Datasource no encontrado"}, 404
         entry = snap.get(ds_id)
         if not entry:
             return {"status": "loading"}, 202
         return jsonify(entry)
     # todos
-    return jsonify(snap)
+    return jsonify({ds_id: value for ds_id, value in snap.items() if ds_id in owned_ids})
 
 @app.route("/api/summary/global")
 def api_summary_global():
     with _cache_lock:
         snap = dict(_cache)
+    owned_ids = get_owned_datasource_ids()
+    snap = {ds_id: value for ds_id, value in snap.items() if ds_id in owned_ids}
     total  = len(snap)
     online = sum(1 for v in snap.values() if not v.get("error") and v.get("metrics"))
-    statuses = [v["metrics"]["status"] for v in snap.values() if v.get("metrics")]
+    statuses = [((v.get("metrics") or {}).get("status")) for v in snap.values() if v.get("metrics")]
+    statuses = [status for status in statuses if status]
     global_st = "CRITICAL" if "CRITICAL" in statuses else "WARNING" if "WARNING" in statuses else "OK"
     return jsonify({
         "total_datasources": total,
@@ -726,7 +1225,7 @@ def api_summary_global():
         "offline": total - online,
         "global_status": global_st,
         "datasources": {
-            ds_id: {"status": v.get("metrics",{}).get("status","unknown"),
+            ds_id: {"status": (v.get("metrics") or {}).get("status","unknown"),
                     "error":  v.get("error"), "ts": v.get("ts")}
             for ds_id, v in snap.items()
         }
@@ -734,6 +1233,8 @@ def api_summary_global():
 
 @app.route("/api/summary/<int:ds_id>")
 def api_summary_ds(ds_id):
+    if ds_id not in get_owned_datasource_ids():
+        return {"status": "loading"}, 202
     with _cache_lock:
         entry = _cache.get(ds_id)
     if not entry:
@@ -743,16 +1244,22 @@ def api_summary_ds(ds_id):
 @app.route("/api/history")
 def api_history():
     ds_id = request.args.get("datasource_id", type=int)
+    owned_ids = get_owned_datasource_ids()
     conn = get_monitor_conn()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         if ds_id:
+            if ds_id not in owned_ids:
+                return {"error": "Datasource no encontrado"}, 404
             cur.execute("""
                 SELECT * FROM health_snapshots WHERE datasource_id=%s
                 ORDER BY id DESC LIMIT 100
             """, (ds_id,))
         else:
-            cur.execute("SELECT * FROM health_snapshots ORDER BY id DESC LIMIT 200")
+            if owned_ids:
+                cur.execute("SELECT * FROM health_snapshots WHERE datasource_id = ANY(%s) ORDER BY id DESC LIMIT 200", (list(owned_ids),))
+            else:
+                cur.execute("SELECT * FROM health_snapshots WHERE 1=0")
         rows = [dict(r) for r in reversed(cur.fetchall())]
         cur.close()
         for r in rows:
@@ -765,16 +1272,22 @@ def api_history():
 @app.route("/api/alerts/history")
 def api_alerts_history():
     ds_id = request.args.get("datasource_id", type=int)
+    owned_ids = get_owned_datasource_ids()
     conn = get_monitor_conn()
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         if ds_id:
+            if ds_id not in owned_ids:
+                return {"error": "Datasource no encontrado"}, 404
             cur.execute("""
                 SELECT * FROM alert_log WHERE datasource_id=%s
                 ORDER BY id DESC LIMIT 50
             """, (ds_id,))
         else:
-            cur.execute("SELECT * FROM alert_log ORDER BY id DESC LIMIT 100")
+            if owned_ids:
+                cur.execute("SELECT * FROM alert_log WHERE datasource_id = ANY(%s) ORDER BY id DESC LIMIT 200", (list(owned_ids),))
+            else:
+                cur.execute("SELECT * FROM alert_log WHERE 1=0")
         rows = [dict(r) for r in cur.fetchall()]
         cur.close()
         for r in rows:

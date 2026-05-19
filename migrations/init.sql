@@ -59,6 +59,23 @@ CREATE TABLE IF NOT EXISTS sql_imports (
     error_message     TEXT
 );
 
+-- Usuarios del sistema de monitoreo
+CREATE TABLE IF NOT EXISTS auth_users (
+    id             SERIAL        PRIMARY KEY,
+    username       VARCHAR(100)  NOT NULL UNIQUE,
+    password_hash  TEXT          NOT NULL,
+    role           VARCHAR(20)   NOT NULL DEFAULT 'viewer',
+    active         BOOLEAN       NOT NULL DEFAULT TRUE,
+    created_at     TIMESTAMPTZ   NOT NULL DEFAULT NOW()
+);
+
+-- Usuarios iniciales para el sistema
+INSERT INTO auth_users (username, password_hash, role, active)
+VALUES
+    ('ariana',  'scrypt:32768:8:1$bwQ1Pvgd1RSE4TEr$200c0dc79fa360f1d76a568d74b6900a61c4ac6cff44f953d8d5a4b8b1e2136f41729255489b1fcbb3f49b712c1a031f48b77dedddac2b18ad00e08b8b897786',  'viewer', TRUE),
+    ('hashira', 'scrypt:32768:8:1$2qn63IXq4p8tGfls$b8c35fdd5215d6acc92a4b05c704cc502314844bc6551045adb439469ba0792c8b39d4b7b4fcb9106db88b18a5c5e19ecd07833a1505de8f0cc8bced15c3cf9e', 'admin',  TRUE)
+ON CONFLICT (username) DO NOTHING;
+
 -- Índices
 CREATE INDEX IF NOT EXISTS idx_snap_ds_at  ON health_snapshots (datasource_id, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_ds_at ON alert_log        (datasource_id, alerted_at  DESC);

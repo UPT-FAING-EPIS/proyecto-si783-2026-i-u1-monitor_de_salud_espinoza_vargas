@@ -5,259 +5,354 @@
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <title>DB Health Monitor</title>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
   <link rel="stylesheet" href="/static/style.css"/>
 </head>
 <body>
-
-<header class="header">
-  <div class="header-left">
-    <div class="logo">
-      <svg width="28" height="28" viewBox="0 0 32 32" fill="none">
-        <path d="M16 2L4 8v8c0 7.7 5.2 14.9 12 17 6.8-2.1 12-9.3 12-17V8L16 2z" fill="url(#shield)"/>
-        <circle cx="16" cy="16" r="5" fill="white" fill-opacity="0.9"/>
-        <defs><linearGradient id="shield" x1="4" y1="2" x2="28" y2="27"><stop stop-color="#4a9eff"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs>
-      </svg>
-      <span class="logo-text">DB<span class="accent">Monitor</span></span>
-    </div>
-  </div>
-  <nav class="nav-tabs">
-    <button class="nav-tab active" onclick="showTab('dashboard')" id="tab-dashboard">📊 Dashboard</button>
-    <button class="nav-tab" onclick="showTab('datasources')" id="tab-datasources">🗄️ Fuentes de Datos</button>
-    <button class="nav-tab" onclick="showTab('import')" id="tab-import">📥 Importar SQL</button>
-  </nav>
-  <div class="header-right">
-    <div id="global-status" class="status-badge badge-ok">OK</div>
-    <div id="conn-dot" class="conn-dot dot-ok" title="Conectado"></div>
-  </div>
-</header>
-
-<!-- ═══════════ DASHBOARD ═══════════ -->
-<main id="section-dashboard" class="main">
-  <div class="section-bar">
-    <label class="sel-label">Fuente:</label>
-    <select id="ds-select" class="ds-select" onchange="onDsChange()">
-      <option value="global">🌐 Vista Global</option>
-    </select>
-    <span id="last-update" class="last-update">–</span>
-  </div>
-
-  <section class="kpi-grid" id="kpi-grid">
-    <div class="kpi-card" id="kpi-conn">
-      <div class="kpi-icon">🔌</div>
-      <div class="kpi-body">
-        <div class="kpi-label">Conexiones</div>
-        <div class="kpi-value" id="kpi-conn-val">–/–</div>
-        <div class="kpi-sub" id="kpi-conn-pct">– % uso</div>
-      </div>
-      <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-conn-bar"></div></div>
-    </div>
-    <div class="kpi-card" id="kpi-cache">
-      <div class="kpi-icon">🗃️</div>
-      <div class="kpi-body">
-        <div class="kpi-label">Cache Hit Ratio</div>
-        <div class="kpi-value" id="kpi-cache-val">–</div>
-        <div class="kpi-sub">Shared Buffers PG</div>
-      </div>
-      <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-cache-bar"></div></div>
-    </div>
-    <div class="kpi-card" id="kpi-cpu">
-      <div class="kpi-icon">⚡</div>
-      <div class="kpi-body">
-        <div class="kpi-label">CPU Host</div>
-        <div class="kpi-value" id="kpi-cpu-val">–</div>
-        <div class="kpi-sub">Uso del procesador</div>
-      </div>
-      <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-cpu-bar"></div></div>
-    </div>
-    <div class="kpi-card" id="kpi-mem">
-      <div class="kpi-icon">💾</div>
-      <div class="kpi-body">
-        <div class="kpi-label">Memoria Host</div>
-        <div class="kpi-value" id="kpi-mem-val">–</div>
-        <div class="kpi-sub">Uso de RAM</div>
-      </div>
-      <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-mem-bar"></div></div>
-    </div>
-    <div class="kpi-card" id="kpi-size">
-      <div class="kpi-icon">📦</div>
-      <div class="kpi-body">
-        <div class="kpi-label">Tamaño BD</div>
-        <div class="kpi-value" id="kpi-size-val">–</div>
-        <div class="kpi-sub">Espacio usado</div>
-      </div>
-    </div>
-    <div class="kpi-card" id="kpi-status-card">
-      <div class="kpi-icon">🛡️</div>
-      <div class="kpi-body">
-        <div class="kpi-label">Estado General</div>
-        <div class="kpi-value" id="kpi-status-val">–</div>
-        <div class="kpi-sub" id="kpi-threads-sub">– activos / – esperando</div>
-      </div>
-    </div>
-  </section>
-
-  <section class="charts-grid">
-    <div class="glass-card chart-card">
-      <h3 class="card-title">🔌 Conexiones en el tiempo</h3>
-      <canvas id="chart-conn"></canvas>
-    </div>
-    <div class="glass-card chart-card">
-      <h3 class="card-title">🗃️ Cache Hit Ratio</h3>
-      <canvas id="chart-cache"></canvas>
-    </div>
-    <div class="glass-card chart-card">
-      <h3 class="card-title">⚡ CPU / Memoria %</h3>
-      <canvas id="chart-sys"></canvas>
-    </div>
-  </section>
-
-  <section class="bottom-grid">
-    <div class="glass-card">
-      <h3 class="card-title">🗄️ Estado por Fuente</h3>
-      <div class="table-wrap">
-        <table class="data-table">
-          <thead><tr><th>Fuente</th><th>Tipo</th><th>Host</th><th>Conexiones</th><th>Cache</th><th>Estado</th></tr></thead>
-          <tbody id="global-table-body"><tr><td colspan="6" class="empty-row">Cargando…</td></tr></tbody>
-        </table>
-      </div>
-    </div>
-  </section>
-</main>
-
-<!-- ═══════════ DATASOURCES ═══════════ -->
-<main id="section-datasources" class="main hidden">
-  <div class="section-header">
-    <h2 class="section-title">🗄️ Fuentes de Datos</h2>
-    <button class="btn-primary" onclick="openDsModal()">+ Nueva Fuente</button>
-  </div>
-  <div class="glass-card">
-    <div class="table-wrap">
-      <table class="data-table">
-        <thead>
-          <tr><th>ID</th><th>Nombre</th><th>Tipo</th><th>Host:Puerto</th><th>BD</th><th>Estado</th><th>Acciones</th></tr>
-        </thead>
-        <tbody id="ds-table-body"><tr><td colspan="7" class="empty-row">Cargando…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-</main>
-
-<!-- ═══════════ IMPORT SQL ═══════════ -->
-<main id="section-import" class="main hidden">
-  <div class="section-header">
-    <h2 class="section-title">📥 Importar SQL</h2>
-  </div>
-  <div class="import-layout">
-    <div class="glass-card import-form-card">
-      <h3 class="card-title">Configurar importación</h3>
-      <div class="form-group">
-        <label>Fuente de destino</label>
-        <select id="import-ds-select" class="ds-select">
-          <option value="">— Selecciona fuente —</option>
-        </select>
-      </div>
-      <div class="form-group">
-        <label>Archivo SQL</label>
-        <div class="drop-zone" id="drop-zone" onclick="document.getElementById('sql-file').click()">
-          <div class="drop-icon">📄</div>
-          <div id="drop-text">Haz clic o arrastra un archivo .sql aquí</div>
-          <div class="drop-sub">Máximo 10 MB</div>
-        </div>
-        <input type="file" id="sql-file" accept=".sql" style="display:none" onchange="onFileSelect(this)"/>
-      </div>
-      <button class="btn-primary btn-full" id="btn-import" onclick="runImport()" disabled>
-        ▶ Ejecutar importación
-      </button>
-    </div>
-
-    <div class="glass-card import-result-card" id="import-result" style="display:none">
-      <h3 class="card-title">Resultado</h3>
-      <div id="import-result-body"></div>
-    </div>
-  </div>
-
-  <div class="glass-card" style="margin-top:1.5rem">
-    <h3 class="card-title">📋 Historial de importaciones</h3>
-    <div class="table-wrap">
-      <table class="data-table">
-        <thead><tr><th>Fecha</th><th>Fuente</th><th>Archivo</th><th>Estado</th><th>OK</th><th>Fallidas</th><th>Error</th></tr></thead>
-        <tbody id="import-history-body"><tr><td colspan="7" class="empty-row">Cargando…</td></tr></tbody>
-      </table>
-    </div>
-  </div>
-</main>
-
-<!-- ═══════════ MODAL DATASOURCE ═══════════ -->
-<div id="ds-modal" class="modal-overlay hidden">
-  <div class="modal">
-    <div class="modal-header">
-      <h3 id="modal-title">Nueva Fuente de Datos</h3>
-      <button class="modal-close" onclick="closeDsModal()">✕</button>
-    </div>
-    <div class="modal-body">
-      <input type="hidden" id="modal-ds-id"/>
-      <div class="form-row">
-        <div class="form-group">
-          <label>Nombre *</label>
-          <input type="text" id="ds-nombre" placeholder="Mi PostgreSQL" class="form-input"/>
-        </div>
-        <div class="form-group">
-          <label>Tipo *</label>
-          <select id="ds-tipo" class="form-input" onchange="onTipoChange()">
-            <option value="postgresql">PostgreSQL</option>
-            <option value="mysql">MySQL</option>
-            <option value="mariadb">MariaDB</option>
-            <option value="sqlserver">SQL Server (MSSQL)</option>
-            <option value="mongodb">MongoDB</option>
-          </select>
+  <div id="login-screen" class="login-screen">
+    <div class="login-card glass-card">
+      <div class="login-brand">
+        <div class="logo-mark">DB</div>
+        <div>
+          <div class="login-title">DB Health Monitor</div>
+          <div class="login-subtitle">Acceso al panel de bases de datos y archivos</div>
         </div>
       </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>Host *</label>
-          <input type="text" id="ds-host" placeholder="localhost" class="form-input"/>
-        </div>
-        <div class="form-group">
-          <label>Puerto *</label>
-          <input type="number" id="ds-puerto" value="5432" class="form-input"/>
-        </div>
+      <div class="auth-switch">
+        <button type="button" id="mode-login" class="btn-sm btn-mode active">Iniciar sesión</button>
+        <button type="button" id="mode-register" class="btn-sm btn-mode">Crear cuenta</button>
       </div>
-      <div class="form-row">
-        <div class="form-group">
-          <label>Usuario *</label>
-          <input type="text" id="ds-usuario" placeholder="postgres" class="form-input"/>
-        </div>
-        <div class="form-group">
-          <label>Contraseña</label>
-          <input type="password" id="ds-password" placeholder="••••••" class="form-input"/>
-        </div>
-      </div>
-      <div class="form-group">
-        <label>Base de datos *</label>
-        <input type="text" id="ds-database" placeholder="mi_base_de_datos" class="form-input"/>
-      </div>
-      <div class="form-group">
-        <label class="check-label">
-          <input type="checkbox" id="ds-activa" checked/> Activa
+      <form id="login-form" class="login-form">
+        <label class="form-group">
+          <span>Usuario</span>
+          <input id="login-user" class="form-input" type="text" autocomplete="username" placeholder="admin"/>
         </label>
-      </div>
-    </div>
-    <div class="modal-footer">
-      <button class="btn-secondary" onclick="testDsModal()">🔌 Probar conexión</button>
-      <div id="test-result" class="test-result"></div>
-      <button class="btn-primary" onclick="saveDsModal()">💾 Guardar</button>
+        <label class="form-group">
+          <span>Contraseña</span>
+          <input id="login-pass" class="form-input" type="password" autocomplete="current-password" placeholder="••••••••"/>
+        </label>
+        <button type="submit" class="btn-primary btn-full">Entrar</button>
+        <div id="login-error" class="login-error hidden"></div>
+      </form>
+      <form id="register-form" class="login-form hidden">
+        <label class="form-group">
+          <span>Nuevo usuario</span>
+          <input id="register-user" class="form-input" type="text" autocomplete="username" placeholder="nuevo_usuario"/>
+        </label>
+        <label class="form-group">
+          <span>Contraseña</span>
+          <input id="register-pass" class="form-input" type="password" autocomplete="new-password" placeholder="mínimo 6 caracteres"/>
+        </label>
+        <label class="form-group">
+          <span>Confirmar contraseña</span>
+          <input id="register-pass2" class="form-input" type="password" autocomplete="new-password" placeholder="repite la contraseña"/>
+        </label>
+        <button type="submit" class="btn-primary btn-full">Crear cuenta</button>
+        <div id="register-error" class="login-error hidden"></div>
+      </form>
+      <div class="login-help">Los usuarios se guardan en la base de datos PostgreSQL del VM Debian.</div>
     </div>
   </div>
-</div>
 
-<footer class="footer">
-  DB Health Monitor &nbsp;|&nbsp;
-  <a href="/api/health" target="_blank">Health</a> &nbsp;|&nbsp;
-  <a href="/api/datasources" target="_blank">API</a>
-</footer>
+  <div id="app-shell" class="app-shell hidden">
+    <header class="header shell-header">
+      <div class="header-left">
+        <div class="logo">
+          <svg width="28" height="28" viewBox="0 0 32 32" fill="none">
+            <path d="M16 2L4 8v8c0 7.7 5.2 14.9 12 17 6.8-2.1 12-9.3 12-17V8L16 2z" fill="url(#shield)"/>
+            <circle cx="16" cy="16" r="5" fill="white" fill-opacity="0.9"/>
+            <defs><linearGradient id="shield" x1="4" y1="2" x2="28" y2="27"><stop stop-color="#4a9eff"/><stop offset="1" stop-color="#a855f7"/></linearGradient></defs>
+          </svg>
+          <span class="logo-text">DB<span class="accent">Monitor</span></span>
+        </div>
+      </div>
 
-<script src="/static/dashboard.js"></script>
+      <nav class="view-tabs glass-card shell-tabs">
+        <button type="button" class="tab-btn active" data-tab-target="overview">Resumen</button>
+        <button type="button" class="tab-btn" data-tab-target="sources">Fuentes de datos</button>
+        <button type="button" class="tab-btn" data-tab-target="files">Archivos</button>
+        <button type="button" class="tab-btn" data-tab-target="status">Estado</button>
+        <button type="button" class="tab-btn" data-tab-target="alerts">Alertas</button>
+        <button type="button" class="tab-btn admin-only hidden" data-tab-target="admin">Administración</button>
+      </nav>
+
+      <div class="header-right">
+        <div id="user-chip" class="user-chip">Usuario: –</div>
+        <div id="global-status" class="status-badge badge-info">Cargando</div>
+        <div id="conn-dot" class="conn-dot dot-warn" title="Estado de conexión"></div>
+        <button id="logout-btn" class="btn-secondary">Salir</button>
+      </div>
+    </header>
+
+    <main class="main">
+      <section class="tab-panel" data-tab-panel="overview">
+        <section class="hero-grid">
+          <div class="hero-copy glass-card">
+            <div class="hero-kicker">Monitoreo por base y por archivos</div>
+            <h1>Visión clara de cada BD, sus archivos y su configuración</h1>
+            <p>Selecciona una base de datos y filtra qué archivos quieres vigilar. El panel resume conexiones, rendimiento, disco, memoria y estado del servidor.</p>
+            <div class="hero-meta">
+              <div class="hero-pill"><span>Actualización</span><strong id="refresh-value">10 s</strong></div>
+              <div class="hero-pill"><span>Última lectura</span><strong id="last-update">–</strong></div>
+            </div>
+          </div>
+          <div class="hero-card glass-card">
+            <div class="hero-card-head">
+              <span>Resumen global</span>
+              <strong id="global-summary-text">–</strong>
+            </div>
+            <div class="hero-stats">
+              <div><span>BD activas</span><strong id="sum-total">–</strong></div>
+              <div><span>Conectadas</span><strong id="sum-online">–</strong></div>
+              <div><span>Offline</span><strong id="sum-offline">–</strong></div>
+              <div><span>Archivos</span><strong id="sum-files">–</strong></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="kpi-grid">
+          <div class="kpi-card" id="kpi-conn">
+            <div class="kpi-icon">🔌</div>
+            <div class="kpi-body">
+              <div class="kpi-label">Conexiones</div>
+              <div class="kpi-value" id="kpi-conn-val">–/–</div>
+              <div class="kpi-sub" id="kpi-conn-pct">– % uso</div>
+            </div>
+            <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-conn-bar"></div></div>
+          </div>
+          <div class="kpi-card" id="kpi-cache">
+            <div class="kpi-icon">🗃️</div>
+            <div class="kpi-body">
+              <div class="kpi-label">Cache Hit Ratio</div>
+              <div class="kpi-value" id="kpi-cache-val">–</div>
+              <div class="kpi-sub">Motor de base de datos</div>
+            </div>
+            <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-cache-bar"></div></div>
+          </div>
+          <div class="kpi-card" id="kpi-cpu">
+            <div class="kpi-icon">⚡</div>
+            <div class="kpi-body">
+              <div class="kpi-label">CPU Host</div>
+              <div class="kpi-value" id="kpi-cpu-val">–</div>
+              <div class="kpi-sub">Uso del servidor</div>
+            </div>
+            <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-cpu-bar"></div></div>
+          </div>
+          <div class="kpi-card" id="kpi-mem">
+            <div class="kpi-icon">💾</div>
+            <div class="kpi-body">
+              <div class="kpi-label">Memoria Host</div>
+              <div class="kpi-value" id="kpi-mem-val">–</div>
+              <div class="kpi-sub">RAM usada</div>
+            </div>
+            <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-mem-bar"></div></div>
+          </div>
+          <div class="kpi-card" id="kpi-disk">
+            <div class="kpi-icon">🧱</div>
+            <div class="kpi-body">
+              <div class="kpi-label">Disco</div>
+              <div class="kpi-value" id="kpi-disk-val">–</div>
+              <div class="kpi-sub" id="kpi-disk-sub">Libre –</div>
+            </div>
+            <div class="kpi-bar-wrap"><div class="kpi-bar" id="kpi-disk-bar"></div></div>
+          </div>
+          <div class="kpi-card" id="kpi-status-card">
+            <div class="kpi-icon">🛡️</div>
+            <div class="kpi-body">
+              <div class="kpi-label">Estado General</div>
+              <div class="kpi-value" id="kpi-status-val">–</div>
+              <div class="kpi-sub" id="kpi-threads-sub">– activos / – esperando</div>
+            </div>
+          </div>
+        </section>
+
+        <section class="charts-grid">
+          <div class="glass-card chart-card">
+            <h3 class="card-title">🔌 Conexiones y estado</h3>
+            <canvas id="chart-conn"></canvas>
+          </div>
+          <div class="glass-card chart-card">
+            <h3 class="card-title">🗃️ Cache Hit Ratio</h3>
+            <canvas id="chart-cache"></canvas>
+          </div>
+          <div class="glass-card chart-card">
+            <h3 class="card-title">⚡ CPU / Memoria %</h3>
+            <canvas id="chart-sys"></canvas>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel hidden" data-tab-panel="sources">
+        <section class="datasource-panel glass-card">
+          <div class="section-top">
+            <div>
+              <div class="section-kicker">Fuentes de datos</div>
+              <h2>Registra tus bases para monitorearlas</h2>
+              <p>Solo verás las bases que hayas creado con tu usuario. Cada fuente queda asociada a tu cuenta.</p>
+            </div>
+            <button id="datasource-refresh" type="button" class="btn-secondary">Refrescar</button>
+          </div>
+          <form id="datasource-form" class="datasource-form">
+            <label class="form-group"><span>Nombre</span><input id="ds-name" class="form-input" type="text" placeholder="Mi PostgreSQL"/></label>
+            <label class="form-group"><span>Tipo</span>
+              <select id="ds-type" class="ds-select">
+                <option value="postgresql">PostgreSQL</option>
+                <option value="mysql">MySQL</option>
+                <option value="mariadb">MariaDB</option>
+                <option value="sqlserver">SQL Server</option>
+                <option value="mongodb">MongoDB</option>
+              </select>
+            </label>
+            <label class="form-group"><span>Host</span><input id="ds-host" class="form-input" type="text" placeholder="127.0.0.1 o IP"/></label>
+            <label class="form-group"><span>Puerto</span><input id="ds-port" class="form-input" type="number" value="5432" min="1"/></label>
+            <label class="form-group"><span>Usuario</span><input id="ds-user" class="form-input" type="text" placeholder="usuario_bd"/></label>
+            <label class="form-group"><span>Clave</span><input id="ds-pass" class="form-input" type="password" placeholder="opcional si no aplica"/></label>
+            <label class="form-group"><span>Base de datos</span><input id="ds-db" class="form-input" type="text" placeholder="nombre_bd"/></label>
+            <label class="form-group form-check"><input id="ds-active" type="checkbox" checked/><span>Activa</span></label>
+            <button type="submit" class="btn-primary btn-full datasource-submit">Agregar fuente</button>
+          </form>
+          <div class="table-shell datasource-table-shell">
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Nombre</th>
+                  <th>Tipo</th>
+                  <th>Host</th>
+                  <th>Base</th>
+                  <th>Estado</th>
+                  <th>Acciones</th>
+                </tr>
+              </thead>
+              <tbody id="datasource-body"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel hidden" data-tab-panel="files">
+        <section class="content-grid">
+          <div class="glass-card">
+            <div class="files-toolbar">
+              <div class="filter-block">
+                <label>Base de datos</label>
+                <select id="db-select" class="ds-select"></select>
+              </div>
+              <div class="filter-block file-types-block">
+                <label>Tipos de archivo</label>
+                <div id="file-type-chips" class="chip-row"></div>
+                <span id="file-type-summary" class="control-hint">Filtros activos: todos</span>
+              </div>
+            </div>
+            <div class="section-card-head">
+              <h3 class="card-title">📄 Archivos y configuración de la BD</h3>
+              <span class="section-note">Selecciona tipos para filtrar</span>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Tipo</th><th>Archivo / Ruta</th><th>Clase</th><th>Existe</th><th>Tamaño</th><th>Modificado</th><th>Entradas</th>
+                  </tr>
+                </thead>
+                <tbody id="file-table-body"><tr><td colspan="7" class="empty-row">Selecciona una base de datos</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel hidden" data-tab-panel="status">
+        <section class="content-grid">
+          <div class="glass-card">
+            <div class="section-card-head">
+              <h3 class="card-title">🗄️ Estado por base de datos</h3>
+              <span class="section-note">Resumen de conexión y rendimiento</span>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>BD</th><th>Tipo</th><th>Host</th><th>Conexiones</th><th>Cache</th><th>Estado</th></tr></thead>
+                <tbody id="db-status-body"><tr><td colspan="6" class="empty-row">Cargando…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel hidden" data-tab-panel="alerts">
+        <section class="content-grid">
+          <div class="glass-card">
+            <div class="section-card-head">
+              <h3 class="card-title">📊 Resumen del sistema</h3>
+              <span class="section-note">Vista general de todas las bases</span>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>Base</th><th>Conectada</th><th>Estado</th><th>Último chequeo</th><th>Error</th></tr></thead>
+                <tbody id="summary-body"><tr><td colspan="5" class="empty-row">Cargando…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="glass-card">
+            <div class="section-card-head">
+              <h3 class="card-title">🔔 Alertas recientes</h3>
+              <span class="section-note">Lo último detectado por el monitor</span>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>Fecha</th><th>Severidad</th><th>Métrica</th><th>Valor</th><th>Mensaje</th></tr></thead>
+                <tbody id="alerts-body"><tr><td colspan="5" class="empty-row">Cargando…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="tab-panel hidden admin-only" data-tab-panel="admin">
+        <section class="admin-grid">
+          <div class="glass-card admin-hero">
+            <div class="section-card-head">
+              <h3 class="card-title">🛠️ Administración</h3>
+              <span class="section-note">Solo visible para el usuario admin</span>
+            </div>
+            <p class="admin-copy">Aquí ves todos los usuarios del sistema y todas las fuentes registradas, para supervisar quién creó cada conexión y revisar el estado global.</p>
+            <div class="hero-stats admin-stats">
+              <div><span>Usuarios</span><strong id="admin-users-count">–</strong></div>
+              <div><span>Fuentes</span><strong id="admin-datasources-count">–</strong></div>
+            </div>
+          </div>
+
+          <div class="glass-card admin-table-card">
+            <div class="section-card-head">
+              <h3 class="card-title">👤 Usuarios</h3>
+              <span class="section-note">Cuentas registradas</span>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>Usuario</th><th>Rol</th><th>Activo</th><th>Creado</th><th>Último acceso</th></tr></thead>
+                <tbody id="admin-users-body"><tr><td colspan="5" class="empty-row">Cargando…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div class="glass-card admin-table-card">
+            <div class="section-card-head">
+              <h3 class="card-title">🗂️ Todas las fuentes</h3>
+              <span class="section-note">Visión completa del sistema</span>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead><tr><th>Nombre</th><th>Dueño</th><th>Tipo</th><th>Host</th><th>Base</th><th>Estado</th></tr></thead>
+                <tbody id="admin-datasources-body"><tr><td colspan="6" class="empty-row">Cargando…</td></tr></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </section>
+    </main>
+  </div>
+
+  <script src="/static/dashboard.js"></script>
 </body>
 </html>
