@@ -1080,10 +1080,22 @@ def api_ds_list():
         for r in rows:
             if hasattr(r.get("created_at"), "isoformat"):
                 r["created_at"] = r["created_at"].isoformat()
+            raw_active = r.get("activa")
+            if isinstance(raw_active, str):
+                r["activa"] = raw_active.strip().lower() in {"1", "true", "t", "yes", "y", "si", "sí"}
+            else:
+                r["activa"] = bool(raw_active)
             ds_id = r["id"]
             with _cache_lock:
                 cached = _cache.get(ds_id, {})
-            r["status"]     = cached.get("metrics", {}).get("status", "unknown") if cached.get("metrics") else "unknown"
+            if not r["activa"]:
+                r["status"] = "disabled"
+            elif cached.get("metrics"):
+                r["status"] = cached.get("metrics", {}).get("status", "unknown")
+            elif cached.get("error"):
+                r["status"] = "error"
+            else:
+                r["status"] = "unknown"
             r["last_error"] = cached.get("error")
             r["last_ts"]    = cached.get("ts")
         return jsonify(rows)
@@ -1188,7 +1200,20 @@ def api_ds_test(ds_id):
     if not ds:
         return {"error": "No encontrado."}, 404
     ok, ms, err = test_datasource(ds)
-    return {"ok": ok, "latency_ms": ms, "error": err}
+    return {
+        "ok": ok,
+        "latency_ms": ms,
+        "error": err,
+        "datasource": {
+            "id": ds.get("id"),
+            "nombre": ds.get("nombre"),
+            "tipo_db": ds.get("tipo_db"),
+            "host": ds.get("host"),
+            "puerto": ds.get("puerto"),
+            "database": ds.get("database"),
+            "activa": bool(ds.get("activa")),
+        },
+    }
 
 # ── Métricas y resumen ────────────────────────────────────────────────────────
 
