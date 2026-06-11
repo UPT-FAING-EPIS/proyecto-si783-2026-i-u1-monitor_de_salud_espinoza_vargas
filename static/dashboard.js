@@ -306,27 +306,64 @@ function renderDatasourceTable() {
     return;
   }
 
-  tbody.innerHTML = datasources.map(ds => `
-    <tr>
-      <td><strong>${ds.nombre}</strong></td>
-      <td>${ds.tipo_db}</td>
-      <td style="font-family:'JetBrains Mono', monospace">${ds.host}:${ds.puerto}</td>
-      <td>${ds.database}</td>
-      <td><span class="pill ${ds.activa ? 'pill-ok' : 'pill-unk'}">${ds.activa ? 'Activa' : 'Inactiva'}</span></td>
-      <td class="row-actions">
-        <button type="button" class="btn-sm" data-test-ds="${ds.id}">Probar</button>
-      </td>
-    </tr>
-  `).join('');
+  tbody.innerHTML = datasources.map(ds => {
+    let statusClassStr = 'pill-unk';
+    let statusLabel = 'Desconocido';
+    if (!ds.activa) {
+      statusClassStr = 'pill-unk';
+      statusLabel = 'Inactiva';
+    } else if (ds.status === 'OK' || ds.status === 'online') {
+      statusClassStr = 'pill-ok';
+      statusLabel = 'En línea';
+    } else if (ds.status === 'WARNING') {
+      statusClassStr = 'pill-warn';
+      statusLabel = 'Advertencia';
+    } else if (ds.status === 'CRITICAL' || ds.status === 'error' || ds.status === 'disabled') {
+      statusClassStr = 'pill-crit';
+      statusLabel = 'Error';
+    }
+
+    return `
+      <tr>
+        <td><strong>${ds.nombre}</strong></td>
+        <td>${ds.tipo_db}</td>
+        <td style="font-family:'JetBrains Mono', monospace">${ds.host}:${ds.puerto}</td>
+        <td>${ds.database}</td>
+        <td><span class="pill ${statusClassStr}">${statusLabel}</span></td>
+        <td class="row-actions">
+          <button type="button" class="btn-sm" data-test-ds="${ds.id}">Probar</button>
+        </td>
+      </tr>
+    `;
+  }).join('');
 
   tbody.querySelectorAll('[data-test-ds]').forEach(btn => {
     btn.addEventListener('click', async () => {
       const dsId = btn.getAttribute('data-test-ds');
-      const response = await apiFetch(`/api/datasources/${dsId}/test`, { method: 'POST' });
-      const data = await response.json();
-      btn.textContent = data.ok ? `${data.latency_ms} ms` : 'Error';
-      btn.classList.toggle('btn-error', !data.ok);
-      btn.classList.toggle('btn-success', data.ok);
+      const detailEl = $('datasource-test-detail');
+      if (detailEl) {
+        detailEl.innerHTML = 'Probando conexión... <span class="spinner"></span>';
+      }
+      try {
+        const response = await apiFetch(`/api/datasources/${dsId}/test`, { method: 'POST' });
+        const data = await response.json();
+        btn.textContent = data.ok ? `${data.latency_ms} ms` : 'Error';
+        btn.className = `btn-sm ${data.ok ? 'btn-success' : 'btn-error'}`;
+        
+        if (detailEl) {
+          if (data.ok) {
+            detailEl.innerHTML = `✅ Conexión exitosa a <strong>${data.datasource?.nombre || 'la base de datos'}</strong>. Latencia: <strong>${data.latency_ms} ms</strong>.`;
+          } else {
+            detailEl.innerHTML = `❌ Error de conexión: <code style="color: #f87171; font-family: monospace;">${data.error || 'Desconocido'}</code>`;
+          }
+        }
+      } catch (err) {
+        btn.textContent = 'Error';
+        btn.className = 'btn-sm btn-error';
+        if (detailEl) {
+          detailEl.innerHTML = `❌ Error de red al intentar probar la conexión.`;
+        }
+      }
     });
   });
 }
