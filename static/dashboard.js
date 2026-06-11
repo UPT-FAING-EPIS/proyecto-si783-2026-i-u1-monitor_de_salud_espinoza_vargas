@@ -11,6 +11,9 @@ let pollTimer = null;
 let activeTab = 'overview';
 let currentUserRole = 'viewer';
 let currentUsername = '';
+let _lastAlerts = [];
+let _lastSummaryMap = {};
+let _lastMetricsMap = {};
 
 const history = {
   labels: [],
@@ -44,6 +47,7 @@ function fmtPct(value) {
   if (value === null || value === undefined || Number.isNaN(value)) return '–';
   return `${Number(value).toFixed(1)}%`;
 }
+
 
 function fmtSizeMB(value) {
   if (value === null || value === undefined || Number.isNaN(value)) return '–';
@@ -366,6 +370,7 @@ function renderFileTypeChips() {
 }
 
 function renderSummaryTable(summaryMap) {
+  _lastSummaryMap = summaryMap || {};
   const tbody = $('summary-body');
   if (!tbody) return;
   const rows = Object.entries(summaryMap || {});
@@ -389,6 +394,7 @@ function renderSummaryTable(summaryMap) {
 }
 
 function renderDbStatusTable(metricsMap) {
+  _lastMetricsMap = metricsMap || {};
   const tbody = $('db-status-body');
   if (!tbody) return;
   const rows = datasources.map(ds => {
@@ -409,6 +415,7 @@ function renderDbStatusTable(metricsMap) {
 }
 
 function renderAlerts(alerts) {
+  _lastAlerts = alerts || [];
   const tbody = $('alerts-body');
   if (!tbody) return;
   if (!alerts || !alerts.length) {
@@ -602,6 +609,7 @@ async function refreshAll() {
     tasks.unshift(loadGlobalSummary(), loadMetricsAndTables(), loadFiles());
   }
   await Promise.all(tasks);
+  updateFooter();
 }
 
 function startTimers() {
@@ -760,6 +768,126 @@ async function boot() {
   await loadAdminOverview();
 }
 
+/* ── CSV Export ────────────────────────────────────────────────────────────── */
+
+function exportToCSV(headers, rows, filename) {
+  const csv = [
+    headers.join(','),
+    ...rows.map(r => r.map(cell => `"${String(cell ?? '').replace(/"/g, '""')}"`).join(','))
+  ].join('\n');
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function exportAlerts() {
+  if (!_lastAlerts.length) return;
+  const headers = ['Fecha', 'Severidad', 'Métrica', 'Valor', 'Mensaje'];
+  const rows = _lastAlerts.map(a => [
+    a.alerted_at ? new Date(a.alerted_at).toLocaleString('es-MX') : '',
+    a.severity || '',
+    a.metric_name || a.metric || '',
+    a.metric_value || a.value || '',
+    a.message || '',
+  ]);
+  exportToCSV(headers, rows, `alertas_${new Date().toISOString().slice(0, 10)}.csv`);
+}
+
+function exportSummary() {
+  const entries = Object.entries(_lastSummaryMap);
+  if (!entries.length) return;
+  const headers = ['Base de datos', 'Conectada', 'Estado', 'Último chequeo', 'Error'];
+  const rows = entries.map(([id, entry]) => {
+    const ds = datasources.find(d => String(d.id) === String(id)) || {};
+    return [
+      ds.nombre || `BD #${id}`,
+      entry?.metrics ? 'Sí' : 'No',
+      entry?.metrics?.status || 'unknown',
+      entry?.ts ? new Date(entry.ts).toLocaleString('es-MX') : '',
+      entry?.error || '',
+    ];
+  });
+  exportToCSV(headers, rows, `resumen_${new Date().toISOString().slice(0, 10)}.csv`);
+}
+
+function exportStatus() {
+  if (!datasources.length) return;
+  const headers = ['Base de datos', 'Tipo', 'Host', 'Conexiones', 'Cache Hit', 'Estado'];
+  const rows = datasources.map(ds => {
+    const entry = _lastMetricsMap?.[ds.id] || {};
+    const m = entry.metrics || {};
+    return [
+      ds.nombre,
+      ds.tipo_db,
+      `${ds.host}:${ds.puerto}`,
+      m.threads_connected !== undefined ? `${m.threads_connected}/${m.max_connections}` : '',
+      m.cache_hit_ratio !== undefined ? `${Number(m.cache_hit_ratio).toFixed(1)}%` : '',
+      m.status || (entry.error ? 'ERROR' : 'unknown'),
+    ];
+  });
+  exportToCSV(headers, rows, `estado_bd_${new Date().toISOString().slice(0, 10)}.csv`);
+}
+
+async function exportHistory() {
+  const url = currentDatasourceId ? `/api/history?datasource_id=${currentDatasourceId}` : '/api/history';
+  try {
+    const response = await fetch(url);
+    if (!response.ok) return;
+    const data = await response.json();
+    if (!data.length) {
+      alert('No hay registros históricos para exportar');
+      return;
+    }
+    const headers = ['ID', 'ID Datasource', 'Base de datos', 'Fecha de captura', 'Conexiones Max', 'Conexiones Activas', 'Hilos Corriendo', 'Uso Conexiones %', 'QPS', 'Consultas Lentas', 'Cache Hit Ratio %', 'Tamaño BD MB', 'CPU %', 'Memoria %', 'Estado'];
+    const rows = data.map(r => {
+      const ds = datasources.find(d => String(d.id) === String(r.datasource_id)) || {};
+      return [
+        r.id || '',
+        r.datasource_id || '',
+        ds.nombre || `BD #${r.datasource_id}`,
+        r.captured_at ? new Date(r.captured_at).toLocaleString('es-MX') : '',
+        r.max_connections !== undefined ? r.max_connections : '',
+        r.threads_connected !== undefined ? r.threads_connected : '',
+        r.threads_running !== undefined ? r.threads_running : '',
+        r.connection_pct !== undefined ? `${Number(r.connection_pct).toFixed(1)}%` : '',
+        r.qps !== undefined ? Number(r.qps).toFixed(2) : '',
+        r.slow_queries !== undefined ? r.slow_queries : '',
+        r.cache_hit_ratio !== undefined ? `${Number(r.cache_hit_ratio).toFixed(1)}%` : '',
+        r.db_size_mb !== undefined ? Number(r.db_size_mb).toFixed(2) : '',
+        r.cpu_pct !== undefined ? `${Number(r.cpu_pct).toFixed(1)}%` : '',
+        r.mem_pct !== undefined ? `${Number(r.mem_pct).toFixed(1)}%` : '',
+        r.status || ''
+      ];
+    });
+    const name_suffix = currentDatasourceId ? `ds_${currentDatasourceId}` : 'all';
+    exportToCSV(headers, rows, `historial_${name_suffix}_${new Date().toISOString().slice(0, 10)}.csv`);
+  } catch (err) {
+    console.error('Error al exportar historial:', err);
+  }
+}
+
+async function updateFooter() {
+  try {
+    const res = await fetch('/api/health');
+    if (!res.ok) return;
+    const data = await res.json();
+    setText('footer-version', `DB Health Monitor v${data.version || '1.0.0'}`);
+    setText('footer-uptime', data.uptime_seconds !== undefined ? formatDuration(data.uptime_seconds) : '–');
+    setText('footer-time', data.server_time ? new Date(data.server_time).toLocaleString('es-MX') : '–');
+    setText('footer-sources', fmtNum(datasources.length));
+  } catch {
+    // silent
+  }
+}
+
+/* ── Event binding ────────────────────────────────────────────────────────── */
+
 function bindEvents() {
   $('login-form')?.addEventListener('submit', handleLogin);
   $('register-form')?.addEventListener('submit', handleRegister);
@@ -774,6 +902,10 @@ function bindEvents() {
   });
   $('mode-login')?.addEventListener('click', () => showAuthMode('login'));
   $('mode-register')?.addEventListener('click', () => showAuthMode('register'));
+  $('export-alerts-btn')?.addEventListener('click', exportAlerts);
+  $('export-summary-btn')?.addEventListener('click', exportSummary);
+  $('export-status-btn')?.addEventListener('click', exportStatus);
+  $('export-history-btn')?.addEventListener('click', exportHistory);
   document.querySelectorAll('[data-tab-target]').forEach(button => {
     button.addEventListener('click', () => setActiveTab(button.getAttribute('data-tab-target')));
   });

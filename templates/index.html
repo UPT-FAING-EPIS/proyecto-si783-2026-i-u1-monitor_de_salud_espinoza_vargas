@@ -4,6 +4,7 @@
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
   <title>DB Health Monitor</title>
+  <link rel="icon" type="image/svg+xml" href="/static/favicon.svg"/>
   <link rel="preconnect" href="https://fonts.googleapis.com"/>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
@@ -167,6 +168,14 @@
           </div>
         </section>
 
+        <div class="section-card-head" style="margin-top: 1.5rem; margin-bottom: 0.75rem;">
+          <h3 class="card-title" style="font-size: 1.15rem; margin: 0; display: flex; align-items: center; gap: 8px;">📈 Historial de métricas</h3>
+          <div class="head-actions">
+            <button type="button" class="btn-sm btn-export" id="export-history-btn" title="Exportar historial de métricas a CSV">📥 CSV</button>
+            <span class="section-note">Historial de capturas en base de datos</span>
+          </div>
+        </div>
+
         <section class="charts-grid">
           <div class="glass-card chart-card">
             <h3 class="card-title">🔌 Conexiones y estado</h3>
@@ -270,7 +279,10 @@
           <div class="glass-card">
             <div class="section-card-head">
               <h3 class="card-title">🗄️ Estado por base de datos</h3>
-              <span class="section-note">Resumen de conexión y rendimiento</span>
+              <div class="head-actions">
+                <button type="button" class="btn-sm btn-export" id="export-status-btn" title="Exportar a CSV">📥 CSV</button>
+                <span class="section-note">Resumen de conexión y rendimiento</span>
+              </div>
             </div>
             <div class="table-wrap">
               <table class="data-table">
@@ -287,7 +299,10 @@
           <div class="glass-card">
             <div class="section-card-head">
               <h3 class="card-title">📊 Resumen del sistema</h3>
-              <span class="section-note">Vista general de todas las bases</span>
+              <div class="head-actions">
+                <button type="button" class="btn-sm btn-export" id="export-summary-btn" title="Exportar a CSV">📥 CSV</button>
+                <span class="section-note">Vista general de todas las bases</span>
+              </div>
             </div>
             <div class="table-wrap">
               <table class="data-table">
@@ -300,7 +315,10 @@
           <div class="glass-card">
             <div class="section-card-head">
               <h3 class="card-title">🔔 Alertas recientes</h3>
-              <span class="section-note">Lo último detectado por el monitor</span>
+              <div class="head-actions">
+                <button type="button" class="btn-sm btn-export" id="export-alerts-btn" title="Exportar a CSV">📥 CSV</button>
+                <span class="section-note">Lo último detectado por el monitor</span>
+              </div>
             </div>
             <div class="table-wrap">
               <table class="data-table">
@@ -354,6 +372,17 @@
         </section>
       </section>
     </main>
+    <footer class="app-footer">
+      <div class="footer-inner">
+        <div class="footer-item"><span>🛡️</span><strong id="footer-version">DB Health Monitor v1.0.0</strong></div>
+        <div class="footer-sep"></div>
+        <div class="footer-item"><span>Servidor activo</span><strong id="footer-uptime">–</strong></div>
+        <div class="footer-sep"></div>
+        <div class="footer-item"><span>Hora servidor</span><strong id="footer-time">–</strong></div>
+        <div class="footer-sep"></div>
+        <div class="footer-item"><span>Fuentes</span><strong id="footer-sources">–</strong></div>
+      </div>
+    </footer>
   </div>
 
   <script src="/static/dashboard.js"></script>

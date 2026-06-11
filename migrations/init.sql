@@ -47,17 +47,7 @@ CREATE TABLE IF NOT EXISTS alert_log (
     message       TEXT         NOT NULL
 );
 
--- Historial de importaciones SQL
-CREATE TABLE IF NOT EXISTS sql_imports (
-    id                SERIAL       PRIMARY KEY,
-    datasource_id     INTEGER      REFERENCES datasources(id) ON DELETE SET NULL,
-    filename          VARCHAR(255) NOT NULL,
-    uploaded_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    status            VARCHAR(20)  NOT NULL DEFAULT 'pending', -- success | failed | blocked
-    statements_ok     INTEGER      NOT NULL DEFAULT 0,
-    statements_failed INTEGER      NOT NULL DEFAULT 0,
-    error_message     TEXT
-);
+
 
 -- Usuarios del sistema de monitoreo
 CREATE TABLE IF NOT EXISTS auth_users (
@@ -79,4 +69,4 @@ ON CONFLICT (username) DO NOTHING;
 -- Índices
 CREATE INDEX IF NOT EXISTS idx_snap_ds_at  ON health_snapshots (datasource_id, captured_at DESC);
 CREATE INDEX IF NOT EXISTS idx_alert_ds_at ON alert_log        (datasource_id, alerted_at  DESC);
-CREATE INDEX IF NOT EXISTS idx_import_ds   ON sql_imports      (datasource_id, uploaded_at DESC);
+

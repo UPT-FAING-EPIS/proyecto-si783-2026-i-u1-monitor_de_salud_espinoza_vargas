@@ -559,4 +559,74 @@ body {
   .login-card { padding: 22px; }
   .hero-copy, .hero-card { padding: 18px; }
   .filter-block { min-width: 100%; }
+  .footer-inner { gap: 12px; }
+  .footer-sep { display: none; }
+}
+
+/* ── Export buttons ─────────────────────────────────── */
+.head-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.btn-export {
+  background: rgba(74, 158, 255, 0.08);
+  border: 1px solid rgba(74, 158, 255, 0.22);
+  color: #93c5fd;
+  padding: 0.36rem 0.72rem;
+  border-radius: 10px;
+  font-family: 'Inter', sans-serif;
+  font-size: 0.76rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  white-space: nowrap;
+}
+.btn-export:hover {
+  background: rgba(74, 158, 255, 0.18);
+  border-color: rgba(74, 158, 255, 0.45);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(74, 158, 255, 0.18);
+}
+
+/* ── Footer ────────────────────────────────────────── */
+.app-footer {
+  margin-top: auto;
+  border-top: 1px solid var(--border);
+  padding: 18px 24px;
+  background: linear-gradient(180deg, rgba(8, 10, 23, 0.5), rgba(8, 10, 23, 0.92));
+  backdrop-filter: blur(14px);
+}
+.footer-inner {
+  max-width: 1600px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  flex-wrap: wrap;
+}
+.footer-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.78rem;
+}
+.footer-item span {
+  color: var(--text-muted);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.footer-item strong {
+  color: var(--text-dim);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  font-size: 0.76rem;
+}
+.footer-sep {
+  width: 1px;
+  height: 18px;
+  background: var(--border);
+  flex-shrink: 0;
 }

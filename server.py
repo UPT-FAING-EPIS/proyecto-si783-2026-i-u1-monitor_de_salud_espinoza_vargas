@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Monitor de Salud DB — Flask + PostgreSQL + Multi-datasource + SQL Import."""
+"""Monitor de Salud DB — Flask + PostgreSQL + Multi-datasource."""
 
 import os, re, threading, time, logging, configparser
 from datetime import datetime, timedelta
@@ -34,6 +34,8 @@ BASE_DIR = Path(__file__).parent
 _initialized = threading.Event()
 _cache: dict = {}          # {ds_id: {"metrics": ..., "error": ..., "ts": ...}}
 _cache_lock = threading.Lock()
+_APP_VERSION = "1.0.0"
+_START_TIME = datetime.now()
 
 AUTH_PUBLIC_PATHS = {
     "/",
@@ -327,16 +329,7 @@ INIT_SQL = [
         threshold     VARCHAR(100) NOT NULL DEFAULT '',
         message       TEXT NOT NULL DEFAULT ''
     )""",
-    """CREATE TABLE IF NOT EXISTS sql_imports (
-        id                SERIAL PRIMARY KEY,
-        datasource_id     INTEGER,
-        filename          VARCHAR(255) NOT NULL,
-        uploaded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        status            VARCHAR(20)  NOT NULL DEFAULT 'pending',
-        statements_ok     INTEGER NOT NULL DEFAULT 0,
-        statements_failed INTEGER NOT NULL DEFAULT 0,
-        error_message     TEXT
-    )""",
+
     # 2. Migración: columnas que pueden faltar en BD existente
     "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS datasource_id INTEGER",
     "ALTER TABLE health_snapshots ADD COLUMN IF NOT EXISTS cache_hit_ratio REAL NOT NULL DEFAULT 0",
@@ -355,7 +348,7 @@ INIT_SQL = [
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_auth_users_username ON auth_users (username)",
     "CREATE INDEX IF NOT EXISTS idx_snap_ds  ON health_snapshots (datasource_id, captured_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_alert_ds ON alert_log        (datasource_id, alerted_at  DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_imp_ds   ON sql_imports      (datasource_id, uploaded_at DESC)",
+
 ]
 
 
@@ -863,29 +856,15 @@ def background_collector():
                         alts = evaluate_alerts(m, cfg)
                         if alts: save_alerts(alts, ds_id)
                 except Exception as e:
-                    log.error("DS %s error: %s", ds_id, e)
-                    with _cache_lock:
-                        prev = _cache.get(ds_id, {})
-                        _cache[ds_id] = {"metrics": prev.get("metrics"),
-                                         "error": str(e),
-                                         "ts": datetime.now().isoformat()}
+                    log.error("background_collector: %s", e)
         except Exception as e:
             log.error("background_collector: %s", e)
 
         interval = cfg_int("monitor", "refresh_interval", 10)
         time.sleep(interval)
 
-# ── SQL Import helpers ────────────────────────────────────────────────────────
 
-DANGEROUS_RE = re.compile(
-    r"\b(DROP\s+DATABASE|DROP\s+SCHEMA\s+public|TRUNCATE)\b",
-    re.IGNORECASE
-)
 
-def split_sql(text: str) -> list:
-    text = re.sub(r"--[^\n]*", "", text)
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
-    return [s.strip() for s in text.split(";") if s.strip()]
 
 def get_ds_by_id(ds_id: int) -> dict | None:
     username = current_username()
@@ -930,7 +909,13 @@ def index(): return render_template("index.html")
 @app.route("/api/health")
 def api_health():
     started = _initialized.is_set()
-    return {"status": "ok" if started else "starting"}, 200
+    uptime = int((datetime.now() - _START_TIME).total_seconds())
+    return jsonify({
+        "status": "ok" if started else "starting",
+        "version": _APP_VERSION,
+        "uptime_seconds": uptime,
+        "server_time": datetime.now().isoformat(),
+    })
 
 
 @app.route("/api/me")
@@ -1322,118 +1307,6 @@ def api_alerts_history():
     finally:
         release_conn(conn)
 
-# ── Importación SQL ───────────────────────────────────────────────────────────
-
-@app.route("/api/import-sql", methods=["POST"])
-def api_import_sql():
-    ds_id = request.form.get("datasource_id", type=int)
-    if not ds_id:
-        return {"error": "datasource_id requerido"}, 400
-
-    f = request.files.get("file")
-    if not f:
-        return {"error": "Archivo requerido"}, 400
-    if not f.filename.lower().endswith(".sql"):
-        return {"error": "Solo se aceptan archivos .sql"}, 400
-
-    max_mb  = cfg_int("monitor", "max_sql_upload_mb", 10)
-    content = f.read()
-    if len(content) > max_mb * 1024 * 1024:
-        return {"error": f"Archivo supera el límite de {max_mb} MB"}, 413
-
-    try:
-        sql_text = content.decode("utf-8")
-    except Exception:
-        sql_text = content.decode("latin-1", errors="replace")
-
-    if cfg_bool("monitor", "block_dangerous_sql", True):
-        m = DANGEROUS_RE.search(sql_text)
-        if m:
-            _record_import(ds_id, f.filename, "blocked", 0, 0, f"Instrucción bloqueada: {m.group()}")
-            return {"error": f"Instrucción peligrosa detectada: {m.group()}"}, 400
-
-    ds = get_ds_by_id(ds_id)
-    if not ds:
-        return {"error": "Datasource no encontrado"}, 404
-
-    statements = split_sql(sql_text)
-    if not statements:
-        return {"error": "El archivo no contiene sentencias SQL válidas"}, 400
-
-    ok_count = fail_count = 0
-    errors = []
-    try:
-        conn = connect_to_datasource(ds, timeout=30)
-        conn.autocommit = False
-        cur = conn.cursor()
-        try:
-            for stmt in statements:
-                try:
-                    cur.execute(stmt)
-                    ok_count += 1
-                except Exception as e:
-                    fail_count += 1
-                    errors.append(str(e)[:200])
-                    conn.rollback()
-                    break
-            else:
-                conn.commit()
-        finally:
-            cur.close(); conn.close()
-    except Exception as e:
-        return {"error": f"Error de conexión: {e}"}, 502
-
-    status = "success" if fail_count == 0 else "failed"
-    _record_import(ds_id, f.filename, status, ok_count, fail_count,
-                   errors[0] if errors else None)
-    return jsonify({
-        "status": status,
-        "statements_ok":     ok_count,
-        "statements_failed": fail_count,
-        "total_statements":  len(statements),
-        "errors":            errors[:5],
-    })
-
-def _record_import(ds_id, filename, status, ok, fail, err_msg):
-    try:
-        conn = get_monitor_conn()
-        cur  = conn.cursor()
-        cur.execute("""
-            INSERT INTO sql_imports
-              (datasource_id,filename,status,statements_ok,statements_failed,error_message)
-            VALUES (%s,%s,%s,%s,%s,%s)
-        """, (ds_id, filename, status, ok, fail, err_msg))
-        conn.commit(); cur.close()
-        release_conn(conn)
-    except Exception as e:
-        log.error("No se pudo guardar historial de importación: %s", e)
-
-@app.route("/api/import-history")
-def api_import_history():
-    ds_id = request.args.get("datasource_id", type=int)
-    conn  = get_monitor_conn()
-    try:
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        if ds_id:
-            cur.execute("""
-                SELECT i.*, d.nombre as ds_nombre FROM sql_imports i
-                LEFT JOIN datasources d ON d.id=i.datasource_id
-                WHERE i.datasource_id=%s ORDER BY i.id DESC LIMIT 50
-            """, (ds_id,))
-        else:
-            cur.execute("""
-                SELECT i.*, d.nombre as ds_nombre FROM sql_imports i
-                LEFT JOIN datasources d ON d.id=i.datasource_id
-                ORDER BY i.id DESC LIMIT 100
-            """)
-        rows = [dict(r) for r in cur.fetchall()]
-        cur.close()
-        for r in rows:
-            if hasattr(r.get("uploaded_at"), "isoformat"):
-                r["uploaded_at"] = r["uploaded_at"].isoformat()
-        return jsonify(rows)
-    finally:
-        release_conn(conn)
 
 # ── Config endpoint ───────────────────────────────────────────────────────────
 
@@ -1442,8 +1315,6 @@ def api_config():
     cfg = load_config()
     return jsonify({
         "refresh_interval": cfg_int("monitor","refresh_interval",30),
-        "max_sql_upload_mb": cfg_int("monitor","max_sql_upload_mb",10),
-        "block_dangerous_sql": cfg_bool("monitor","block_dangerous_sql",True),
     })
 
 # ── Arranque ──────────────────────────────────────────────────────────────────
